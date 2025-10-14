@@ -7,6 +7,7 @@ from ring_flash_attn import (
     ring_flash_attn_varlen_kvpacked_func,
     zigzag_ring_flash_attn_varlen_kvpacked_func,
     llama3_flash_attn_varlen_kvpacked_func,
+    zigzag_llama3_flash_attn_varlen_kvpacked_func,
     llama3_flash_attn_prepare_cu_seqlens,
 )
 
@@ -122,6 +123,20 @@ def benchmark(
 
     def wrapper(i: int):
         if use_llama3:
+            kwargs = {
+                "heads_k_stride": 4,
+                "local_k_slice": local_k_slice_list[i % len(cu_seqlens_list)],
+                "causal": causal,
+                "window_size": (-1, -1),
+                "alibi_slopes": None,
+                "deterministic": deterministic,
+                "return_attn_probs": False,
+            }
+            # Only zigzag_llama3 supports fused kernel parameters
+            if f.__name__ == "zigzag_llama3_flash_attn_varlen_kvpacked_func":
+                kwargs["use_fused_kernel_forward"] = True
+                kwargs["use_fused_kernel_backward"] = True
+
             return f(
                 q,
                 kv,
@@ -129,13 +144,7 @@ def benchmark(
                 cu_seqlens_k_list[i % len(cu_seqlens_list)],
                 max_seqlen_q_list[i % len(cu_seqlens_list)],
                 max_seqlen_k_list[i % len(cu_seqlens_list)],
-                heads_k_stride=4,
-                local_k_slice=local_k_slice_list[i % len(cu_seqlens_list)],
-                causal=causal,
-                window_size=(-1, -1),
-                alibi_slopes=None,
-                deterministic=deterministic,
-                return_attn_probs=False,
+                **kwargs,
             )
         elif use_double_cu_seqlens:
             return f(
@@ -227,6 +236,7 @@ if __name__ == "__main__":
 
     for f, use_double_cu_seqlens in [
         (llama3_flash_attn_varlen_kvpacked_func, True),
+        (zigzag_llama3_flash_attn_varlen_kvpacked_func, True),
     ]:
         torch.cuda.empty_cache()
         if rank == 0:

@@ -22,6 +22,20 @@ except:
 
 
 def get_half_index(cu_seqlens, *, front: bool):
+    """
+    Split variable-length sequences into first half (H0) or second half (H1).
+    
+    This is the key to zigzag's load balancing:
+    - H0 (front=True): Early tokens that need less context
+    - H1 (front=False): Later tokens that need more context
+    
+    Args:
+        cu_seqlens: Cumulative sequence lengths [0, len1, len1+len2, ...]
+        front: If True, return H0 indices; if False, return H1 indices
+    
+    Returns:
+        Boolean tensor or slice indicating which tokens to select
+    """
     if len(cu_seqlens) == 2:
         if front:
             return slice(None, cu_seqlens[-1] // 2)
@@ -87,6 +101,23 @@ def zigzag_ring_flash_attn_varlen_forward(
     alibi_slopes=None,
     deterministic=False,
 ):
+    """
+    Zigzag Ring Flash Attention - Forward Pass
+    
+    Implements load-balanced distributed causal attention using a zigzag pattern.
+    K,V tensors rotate through GPUs in a ring, with each step computing attention
+    between different portions of Q and K,V to balance computational load.
+    
+    KEY INSIGHT: The condition 'step <= rank' determines when each GPU switches
+    between two computation modes, ensuring all steps have balanced work:
+    - Mode A (step <= rank): Full Q × Half K,V (8×4 ops)
+    - Mode B (step > rank): Half Q × Full K,V (4×8 ops)
+    
+    This balances the natural load imbalance in causal attention where later
+    tokens need to attend to more previous tokens.
+    
+    See ZIGZAG_EXPLANATION.md for detailed explanation with visualizations.
+    """
     assert causal == True, "zigzag ring is meaningless for causal=False"
     comm = RingComm(process_group)
 
@@ -143,11 +174,17 @@ def zigzag_ring_flash_attn_varlen_forward(
         return block_out, block_lse
 
     old_lse = False
+    # ZIGZAG ALGORITHM: Balance load across communication steps
+    # - Step 0: Local causal attention (all GPUs same work)
+    # - Step <= rank: Full Q × First-half K,V (balanced: 8×4 ops)
+    # - Step > rank: Second-half Q × Full K,V (balanced: 4×8 ops)
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
             next_k, next_v = comm.send_recv_kv(k, v)
 
         if step == 0:
+            # Step 0: Local causal attention with own K,V
+            # All GPUs do same amount of work (causal mask ~50% of matrix)
             block_out, block_lse = forward(q, k, v, causal=True)
             if block_lse.dim() == 3:
                 old_lse = True
@@ -157,6 +194,9 @@ def zigzag_ring_flash_attn_varlen_forward(
                 )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         elif step <= comm.rank:
+            # ZIGZAG MODE A: Full Q attends to first-half K,V
+            # Early tokens (H0) need less context → lighter work per token
+            # Use full Q (8 queries) × half K (4 keys) = 32 ops (balanced!)
             k0 = k[half_index0]
             v0 = v[half_index0]
             block_out, block_lse = forward(q, k0, v0, causal=False)
@@ -168,6 +208,9 @@ def zigzag_ring_flash_attn_varlen_forward(
                 )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         else:
+            # ZIGZAG MODE B: Second-half Q attends to full K,V
+            # Later tokens (H1) need more context → heavier work per token
+            # Use half Q (4 queries) × full K (8 keys) = 32 ops (balanced!)
             block_out, block_lse = forward(q1, k, v, causal=False)
             if block_lse.dim() == 3:
                 old_lse = True
