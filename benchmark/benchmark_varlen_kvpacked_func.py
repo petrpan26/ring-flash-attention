@@ -12,6 +12,19 @@ from ring_flash_attn import (
 )
 
 
+def extract_local(value, cu_seqlens, rank, world_size):
+    """Extract local zigzag-distributed portion for this rank."""
+    local_values = []
+    for i in range(len(cu_seqlens) - 1):
+        start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+        local_value = value[start:end].chunk(2 * world_size, dim=0)
+        local_values.extend([
+            local_value[rank].detach().clone(),
+            local_value[2 * world_size - 1 - rank].detach().clone(),
+        ])
+    return torch.cat(local_values, dim=0).contiguous()
+
+
 def benchmark(
     f,
     use_double_cu_seqlens,
@@ -40,6 +53,7 @@ def benchmark(
     assert seqlen % (2 * world_size) == 0
     assert head_dim % 8 == 0
 
+    # Create data - for zigzag_llama3 we need to broadcast to all ranks
     q = torch.randn(
         seqlen, num_heads, head_dim, device=device, dtype=dtype, requires_grad=True
     )
@@ -53,6 +67,12 @@ def benchmark(
         requires_grad=True,
     )
     dout = torch.randn(seqlen, num_heads, head_dim, device=device, dtype=dtype)
+
+    # For zigzag methods, broadcast so all ranks have the same full data
+    if f.__name__ in ["zigzag_llama3_flash_attn_varlen_kvpacked_func", "zigzag_ring_flash_attn_varlen_kvpacked_func"]:
+        dist.broadcast(q, src=0)
+        dist.broadcast(kv, src=0)
+        dist.broadcast(dout, src=0)
 
     cu_seqlens_list = [
         torch.tensor([0, 8192], device=device, dtype=torch.int32),
@@ -69,6 +89,37 @@ def benchmark(
         max_seqlen_q_list = []
         max_seqlen_k_list = []
         local_k_slice_list = []
+
+        # For zigzag_llama3, pre-extract local data for all cu_seqlens patterns
+        if f.__name__ == "zigzag_llama3_flash_attn_varlen_kvpacked_func":
+            local_q_list = []
+            local_kv_list = []
+            local_dout_list = []
+            local_cu_seqlens_q_list = []
+
+            for cu_seqlens in cu_seqlens_list:
+                # Extract local zigzag portions
+                local_q = extract_local(q, cu_seqlens, rank, world_size)
+                local_kv = extract_local(kv, cu_seqlens, rank, world_size)
+                local_dout = extract_local(dout, cu_seqlens, rank, world_size)
+                local_q.requires_grad = True
+                local_kv.requires_grad = True
+
+                local_q_list.append(local_q)
+                local_kv_list.append(local_kv)
+                local_dout_list.append(local_dout)
+
+                # Prepare LOCAL cu_seqlens for Q
+                local_cu_seqlens = []
+                offset = 0
+                for i in range(len(cu_seqlens) - 1):
+                    seq_len = (cu_seqlens[i+1] - cu_seqlens[i]).item()
+                    local_seq_len = seq_len // world_size
+                    local_cu_seqlens.append(offset)
+                    offset += local_seq_len
+                local_cu_seqlens.append(offset)
+                local_cu_seqlens_q_list.append(torch.tensor(local_cu_seqlens, dtype=torch.int32, device=device))
+
         for cu_seqlens in cu_seqlens_list:
             (
                 cu_seqlens_q,
@@ -125,27 +176,40 @@ def benchmark(
 
     def wrapper(i: int):
         if use_llama3:
+            idx = i % len(cu_seqlens_list)
             kwargs = {
                 "heads_k_stride": 4,
-                "local_k_slice": local_k_slice_list[i % len(cu_seqlens_list)],
+                "local_k_slice": local_k_slice_list[idx],
                 "causal": causal,
                 "window_size": (-1, -1),
                 "alibi_slopes": None,
                 "deterministic": deterministic,
                 "return_attn_probs": False,
             }
-            # Only zigzag_llama3 supports fused kernel parameters
+            # zigzag_llama3 needs special handling: use pre-extracted local data
             if f.__name__ == "zigzag_llama3_flash_attn_varlen_kvpacked_func":
                 kwargs["use_fused_kernel_forward"] = use_fused_kernel_forward
                 kwargs["use_fused_kernel_backward"] = use_fused_kernel_backward
+                kwargs["n_chunks"] = 2
+                kwargs["heads_k_stride"] = num_kv_heads
+
+                return f(
+                    local_q_list[idx],
+                    local_kv_list[idx],
+                    local_cu_seqlens_q_list[idx],  # LOCAL cu_seqlens for Q
+                    cu_seqlens_list[idx],          # GLOBAL cu_seqlens for K
+                    max_seqlen_q_list[idx],
+                    max_seqlen_k_list[idx],
+                    **kwargs,
+                )
 
             return f(
                 q,
                 kv,
-                cu_seqlens_q_list[i % len(cu_seqlens_list)],
-                cu_seqlens_k_list[i % len(cu_seqlens_list)],
-                max_seqlen_q_list[i % len(cu_seqlens_list)],
-                max_seqlen_k_list[i % len(cu_seqlens_list)],
+                cu_seqlens_q_list[idx],
+                cu_seqlens_k_list[idx],
+                max_seqlen_q_list[idx],
+                max_seqlen_k_list[idx],
                 **kwargs,
             )
         elif use_double_cu_seqlens:
@@ -180,13 +244,24 @@ def benchmark(
             for i in range(num_iter):
                 _ = wrapper(i)
     else:
-        for i in range(num_iter):
-            q.grad = None
-            kv.grad = None
-            out = wrapper(i)
-            out.backward(dout)
-            if profile:
-                profiler.step()
+        # For zigzag_llama3, use pre-extracted local gradients
+        if f.__name__ == "zigzag_llama3_flash_attn_varlen_kvpacked_func":
+            for i in range(num_iter):
+                idx = i % len(cu_seqlens_list)
+                local_q_list[idx].grad = None
+                local_kv_list[idx].grad = None
+                out = wrapper(i)
+                out.backward(local_dout_list[idx])
+                if profile:
+                    profiler.step()
+        else:
+            for i in range(num_iter):
+                q.grad = None
+                kv.grad = None
+                out = wrapper(i)
+                out.backward(dout)
+                if profile:
+                    profiler.step()
     end = torch.cuda.Event(enable_timing=True)
     end.record()
     torch.cuda.synchronize(device=device)
