@@ -194,12 +194,19 @@ if __name__ == "__main__":
 
     forward_only = False
     profile = False
-    num_iter = 500 if forward_only else 100
     compile_func = False
 
-    if len(sys.argv) > 1 and sys.argv[1] == "compile":
-        compile_func = True
-        torch._dynamo.config.capture_scalar_outputs = True
+    # Parse command line arguments
+    for arg in sys.argv[1:]:
+        if arg == "compile":
+            compile_func = True
+            torch._dynamo.config.capture_scalar_outputs = True
+        elif arg == "forward_only":
+            forward_only = True
+        elif arg == "profile":
+            profile = True
+
+    num_iter = 500 if forward_only else 100
 
     for f, use_double_cu_seqlens in [
         (flash_attn_varlen_kvpacked_func, True),
@@ -266,7 +273,11 @@ if __name__ == "__main__":
         return torch.cat(local_values, dim=0).contiguous()
 
     # Prepare data for zigzag_llama3
-    seqlen = 1024 * 8
+    # To match other benchmarks: each rank processes 8192 tokens
+    # So total tokens = 8192 * world_size
+    seqlen_per_rank = 1024 * 8
+    world_size = dist.get_world_size()
+    total_seqlen = seqlen_per_rank * world_size
     num_heads = 32
     num_kv_heads = 8
     head_dim = 128
@@ -274,15 +285,15 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
 
     # Create full sequences and broadcast
-    q_full = torch.randn(seqlen, num_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
-    kv_full = torch.randn(seqlen, 2, num_kv_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
-    dout_full = torch.randn(seqlen, num_heads, head_dim, device=device, dtype=dtype)
+    q_full = torch.randn(total_seqlen, num_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
+    kv_full = torch.randn(total_seqlen, 2, num_kv_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
+    dout_full = torch.randn(total_seqlen, num_heads, head_dim, device=device, dtype=dtype)
 
     dist.broadcast(q_full, src=0)
     dist.broadcast(kv_full, src=0)
     dist.broadcast(dout_full, src=0)
 
-    cu_seqlens_single = torch.tensor([0, 8192], device=device, dtype=torch.int32)
+    cu_seqlens_single = torch.tensor([0, total_seqlen], device=device, dtype=torch.int32)
 
     # Extract local zigzag portions
     local_q = extract_local_zigzag(q_full, cu_seqlens_single, rank, dist.get_world_size())
@@ -292,9 +303,8 @@ if __name__ == "__main__":
     local_kv.requires_grad = True
 
     # Prepare local cu_seqlens for Q
-    seq_len = (cu_seqlens_single[1] - cu_seqlens_single[0]).item()
-    local_seq_len = seq_len // dist.get_world_size()
-    local_cu_seqlens_q = torch.tensor([0, local_seq_len], dtype=torch.int32, device=device)
+    # Each rank gets seqlen_per_rank tokens after zigzag extraction
+    local_cu_seqlens_q = torch.tensor([0, seqlen_per_rank], dtype=torch.int32, device=device)
 
     # Prepare parameters
     _, _, max_seqlen_q, max_seqlen_k, local_k_slice = llama3_flash_attn_prepare_cu_seqlens(
