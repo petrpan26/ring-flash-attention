@@ -70,11 +70,15 @@ Early group: chunks [0, 1, 2, 3]      (indices < world_size)
 Late group:  chunks [4, 5, 6, 7]      (indices >= world_size)
 ```
 
-**Key Rule:**
-- Early chunks attend to K,V up to the **last early chunk** (chunk 3)
-- Late chunks attend to K,V up to the **last late chunk** (chunk 7)
+**Causality Rule:**
 
-This creates the load balancing benefit!
+To maintain causality, a query from a chunk with global index `i` attends to K,V from all chunks up to and including chunk `i`.
+
+For example:
+- Queries from `chunk[2]` attend to K,V from `[c0, c1, c2]`
+- Queries from `chunk[5]` attend to K,V from `[c0, c1, c2, c3, c4, c5]`
+
+The implementation groups queries by "early" and "late" chunks for efficiency, but the core causality is respected on a per-chunk basis. This creates the load balancing benefit!
 
 ### 3. Llama3-Style All-Gather
 
@@ -937,50 +941,42 @@ Let's calculate how many operations each chunk requires:
 ```
 Chunk Index | Attends To | K,V Tokens | Q Tokens | Heads | FLOPs
 ------------|------------|------------|----------|-------|------------------
-c0          | [c0]       | 4096       | 4096     | 32    | 8.6 B
-c1          | [c0,c1]    | 8192       | 4096     | 32    | 17.2 B
-c2          | [c0..c2]   | 12288      | 4096     | 32    | 25.8 B
-c3          | [c0..c3]   | 16384      | 4096     | 32    | 34.4 B
-c4          | [c0..c4]   | 20480      | 4096     | 32    | 43.0 B
-c5          | [c0..c5]   | 24576      | 4096     | 32    | 51.5 B
-c6          | [c0..c6]   | 28672      | 4096     | 32    | 60.1 B
-c7          | [c0..c7]   | 32768      | 4096     | 32    | 68.7 B
+c0          | [c0]       | 4096       | 4096     | 32    | 274.9 B
+c1          | [c0,c1]    | 8192       | 4096     | 32    | 549.8 B
+c2          | [c0..c2]   | 12288      | 4096     | 32    | 824.6 B
+c3          | [c0..c3]   | 16384      | 4096     | 32    | 1,099.5 B
+c4          | [c0..c4]   | 20480      | 4096     | 32    | 1,374.4 B
+c5          | [c0..c5]   | 24576      | 4096     | 32    | 1,649.3 B
+c6          | [c0..c6]   | 28672      | 4096     | 32    | 1,924.1 B
+c7          | [c0..c7]   | 32768      | 4096     | 32    | 2,199.0 B
 
-Total: 309.3 B FLOPs across all chunks
+Total: 9,895.6 B FLOPs across all chunks
 ```
 
 **Detailed calculation for chunk 0:**
 ```
-FLOPs(c0) = 4 × 4096 × 4096 × 32 × 128
-          = 4 × 4096 × 4096 × 4096
-          = 274,877,906,944
-          ≈ 275 B FLOPs
-
-Wait, let me recalculate with GQA (8 KV heads, 32 Q heads):
-Each Q head attends independently, but K,V have fewer heads (GQA).
-
-More accurate formula:
 FLOPs = 2 × Q_tokens × K_tokens × Q_heads × head_dim  (Q @ K^T)
       + 2 × Q_tokens × K_tokens × Q_heads × head_dim  (Attn @ V)
+      = 4 × Q_tokens × K_tokens × Q_heads × head_dim
 
 FLOPs(c0) = 4 × 4096 × 4096 × 32 × 128
-          = 8,589,934,592
-          ≈ 8.6 B FLOPs
+          = 274,877,906,944
+          ≈ 274.9 B FLOPs
 ```
 
 ### Operations per GPU - Contiguous Distribution
 
 ```
-GPU  | Chunks  | Operations (B FLOPs)      | Total FLOPs
------|---------|---------------------------|-------------
-GPU 0| [c0,c1] | 8.6 + 17.2                | 25.8 B
-GPU 1| [c2,c3] | 25.8 + 34.4               | 60.2 B
-GPU 2| [c4,c5] | 43.0 + 51.5               | 94.5 B
-GPU 3| [c6,c7] | 60.1 + 68.7               | 128.8 B
-GPU 4| [c8,c9] | 77.3 + 85.9               | 163.2 B
-GPU 5| [c10,c11]| 94.4 + 103.0             | 197.4 B
-GPU 6| [c12,c13]| 111.6 + 120.2            | 231.8 B
-GPU 7| [c14,c15]| 128.7 + 137.3            | 266.0 B
+GPU  | Chunks  | Operations (B FLOPs)         | Total FLOPs
+-----|---------|------------------------------|-------------
+GPU 0| [c0,c1] | 274.9 + 549.8                | 824.6 B
+GPU 1| [c2,c3] | 824.6 + 1,099.5              | 1,924.1 B
+GPU 2| [c4,c5] | 1,374.4 + 1,649.3            | 3,023.7 B
+GPU 3| [c6,c7] | 1,924.1 + 2,199.0            | 4,123.1 B
+GPU 4| [c8,c9] | 2,473.9 + 2,748.8            | 5,222.7 B
+GPU 5| [c10,c11]| 3,023.7 + 3,298.5           | 6,322.2 B
+GPU 6| [c12,c13]| 3,573.5 + 3,848.4           | 7,421.8 B
+GPU 7| [c14,c15]| 4,123.3 + 4,398.0           | 8,521.3 B
 
 Load imbalance: GPU 7 does 10.3× more work than GPU 0! ⚠️
 ```
@@ -988,18 +984,18 @@ Load imbalance: GPU 7 does 10.3× more work than GPU 0! ⚠️
 ### Operations per GPU - Zigzag Distribution
 
 ```
-GPU  | Chunks   | Operations (B FLOPs)      | Total FLOPs
------|----------|---------------------------|-------------
-GPU 0| [c0,c15] | 8.6 + 137.3               | 145.9 B
-GPU 1| [c1,c14] | 17.2 + 128.7              | 145.9 B
-GPU 2| [c2,c13] | 25.8 + 120.2              | 146.0 B
-GPU 3| [c3,c12] | 34.4 + 111.6              | 146.0 B
-GPU 4| [c4,c11] | 43.0 + 103.0              | 146.0 B
-GPU 5| [c5,c10] | 51.5 + 94.4               | 145.9 B
-GPU 6| [c6,c9]  | 60.1 + 85.9               | 146.0 B
-GPU 7| [c7,c8]  | 68.7 + 77.3               | 146.0 B
+GPU  | Chunks   | Operations (B FLOPs)         | Total FLOPs
+-----|----------|------------------------------|-------------
+GPU 0| [c0,c15] | 274.9 + 4,398.0              | 4,672.9 B
+GPU 1| [c1,c14] | 549.8 + 4,123.3              | 4,673.1 B
+GPU 2| [c2,c13] | 824.6 + 3,848.4              | 4,673.0 B
+GPU 3| [c3,c12] | 1,099.5 + 3,573.5            | 4,673.0 B
+GPU 4| [c4,c11] | 1,374.4 + 3,298.5            | 4,672.9 B
+GPU 5| [c5,c10] | 1,649.3 + 3,023.7            | 4,673.0 B
+GPU 6| [c6,c9]  | 1,924.1 + 2,748.8            | 4,672.9 B
+GPU 7| [c7,c8]  | 2,199.0 + 2,473.9            | 4,672.9 B
 
-Perfect balance: All GPUs do ~146 B FLOPs! ✅
+Perfect balance: All GPUs do ~4,673 B FLOPs! ✅
 ```
 
 ### Concrete Example with Real Numbers
@@ -1019,34 +1015,34 @@ def compute_flops(q_tokens, k_tokens, heads, dim):
 # Example: GPU 0 with zigzag distribution
 # Chunk 0: attends to 4096 tokens (itself)
 flops_c0 = compute_flops(4096, 4096, 32, 128)
-# = 8,589,934,592 ≈ 8.6 GFLOPs
+# = 274,877,906,944 ≈ 274.9 GFLOPs
 
 # Chunk 15: attends to 65536 tokens (all 16 chunks)
 flops_c15 = compute_flops(4096, 65536, 32, 128)
-# = 137,438,953,472 ≈ 137.4 GFLOPs
+# = 4,398,046,511,104 ≈ 4,398.0 GFLOPs
 
 # Total for GPU 0
 total_gpu0 = flops_c0 + flops_c15
-# = 146,028,888,064 ≈ 146.0 GFLOPs
+# = 4,672,924,418,048 ≈ 4,672.9 GFLOPs
 ```
 
 ### Summary: Operations per GPU
 
 | Distribution | Min FLOPs | Max FLOPs | Imbalance Ratio | Theoretical Impact |
 |--------------|-----------|-----------|-----------------|-------------------|
-| **Contiguous** | 25.8 B | 266.0 B | 10.3× | GPU 7 bottleneck |
-| **Zigzag** | 145.9 B | 146.0 B | 1.00× | Balanced workload |
+| **Contiguous** | 824.6 B | 8,521.3 B | 10.3× | GPU 7 bottleneck |
+| **Zigzag** | 4,672.9 B | 4,673.1 B | 1.00× | Balanced workload |
 
 **Theoretical Analysis:**
 
 In contiguous distribution:
-- GPU 0 performs 25.8 B FLOPs (lightest workload)
-- GPU 7 performs 266.0 B FLOPs (heaviest workload)
+- GPU 0 performs 824.6 B FLOPs (lightest workload)
+- GPU 7 performs 8,521.3 B FLOPs (heaviest workload)
 - **Imbalance ratio: 10.3×** - GPU 7 does 10.3× more work than GPU 0
 - Bottleneck: GPU 7 determines overall throughput (other GPUs wait idle)
 
 In zigzag distribution:
-- All GPUs perform ~146.0 B FLOPs (equal workload)
+- All GPUs perform ~4,673 B FLOPs (equal workload)
 - **Imbalance ratio: 1.00×** - perfect balance
 - No bottleneck: All GPUs finish simultaneously
 - Theoretically eliminates GPU idle time

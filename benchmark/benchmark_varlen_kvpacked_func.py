@@ -20,6 +20,8 @@ def benchmark(
     forward_only=True,
     log=True,
     profile=False,
+    use_fused_kernel_forward=True,
+    use_fused_kernel_backward=True,
 ):
     dtype = torch.bfloat16
     rank = dist.get_rank()
@@ -134,8 +136,8 @@ def benchmark(
             }
             # Only zigzag_llama3 supports fused kernel parameters
             if f.__name__ == "zigzag_llama3_flash_attn_varlen_kvpacked_func":
-                kwargs["use_fused_kernel_forward"] = True
-                kwargs["use_fused_kernel_backward"] = True
+                kwargs["use_fused_kernel_forward"] = use_fused_kernel_forward
+                kwargs["use_fused_kernel_backward"] = use_fused_kernel_backward
 
             return f(
                 q,
@@ -234,9 +236,9 @@ if __name__ == "__main__":
             profile=profile,
         )
 
+    # Benchmark llama3_flash_attn (no kernel mode options)
     for f, use_double_cu_seqlens in [
         (llama3_flash_attn_varlen_kvpacked_func, True),
-        (zigzag_llama3_flash_attn_varlen_kvpacked_func, True),
     ]:
         torch.cuda.empty_cache()
         if rank == 0:
@@ -258,6 +260,39 @@ if __name__ == "__main__":
             num_iter=num_iter,
             log=True,
             profile=profile,
+        )
+
+    # Benchmark zigzag_llama3_flash_attn with all 4 kernel mode combinations
+    for use_fused_fwd, use_fused_bwd, mode_name in [
+        (False, False, "Two-Kernels Forward, Two-Kernels Backward"),
+        (False, True, "Two-Kernels Forward, Fused Backward"),
+        (True, False, "Fused Forward, Two-Kernels Backward"),
+        (True, True, "Fused Forward, Fused Backward"),
+    ]:
+        torch.cuda.empty_cache()
+        if rank == 0:
+            print(f"# zigzag_llama3_flash_attn_varlen_kvpacked_func ({mode_name})")
+        f = torch.compile(zigzag_llama3_flash_attn_varlen_kvpacked_func) if compile_func else zigzag_llama3_flash_attn_varlen_kvpacked_func
+        benchmark(
+            f,
+            use_double_cu_seqlens=True,
+            use_llama3=True,
+            forward_only=forward_only,
+            num_iter=num_iter,
+            log=False,
+            use_fused_kernel_forward=use_fused_fwd,
+            use_fused_kernel_backward=use_fused_bwd,
+        )
+        benchmark(
+            f,
+            use_double_cu_seqlens=True,
+            use_llama3=True,
+            forward_only=forward_only,
+            num_iter=num_iter,
+            log=True,
+            profile=profile,
+            use_fused_kernel_forward=use_fused_fwd,
+            use_fused_kernel_backward=use_fused_bwd,
         )
 
     dist.destroy_process_group()

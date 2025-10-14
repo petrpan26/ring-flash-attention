@@ -108,8 +108,11 @@ def main():
         print("# Testing Zigzag Llama3 Flash Attention (varlen)")
         print("#" * 60)
 
-    # Test only fused kernel mode
+    # Test all 4 execution modes
     modes = [
+        (False, False, "Two-Kernels Forward, Two-Kernels Backward"),
+        (False, True, "Two-Kernels Forward, Fused Backward"),
+        (True, False, "Fused Forward, Two-Kernels Backward"),
         (True, True, "Fused Forward, Fused Backward"),
     ]
 
