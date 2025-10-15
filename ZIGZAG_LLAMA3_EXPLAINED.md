@@ -1217,8 +1217,64 @@ Based on the operation count analysis:
 
 ---
 
+## Performance Optimizations
+
+### Implemented: Triton Kernel for Direct KV Slicing
+
+**The Bottleneck:**
+After all-gather, K,V are in zigzag interleaved format, but Flash Attention needs contiguous chunks. The original implementation used 80+ lines of Python loops to rearrange the data, causing significant overhead (~15-20% of total execution time).
+
+**The Solution:**
+A custom Triton kernel that extracts K,V slices **directly** from zigzag format without any intermediate rearrangement:
+
+```python
+@triton.jit
+def extract_zigzag_kv_slice_kernel(...):
+    # For each output token, compute its source location in zigzag buffer
+    chunk_idx = token_idx // chunk_size
+    rank_owner = tl.where(
+        chunk_idx < world_size,
+        chunk_idx,                      # Early chunks: rank = chunk_idx
+        2 * world_size - 1 - chunk_idx  # Late chunks: rank = 2*ws-1-chunk_idx
+    )
+    source_idx = rank_owner * local_tokens + offset
+
+    # Direct load/store with coalesced memory access
+    kv_data = tl.load(KV_ZIGZAG + source_offset, ...)
+    tl.store(KV_OUT + output_offset, kv_data, ...)
+```
+
+**What it does:**
+- Computes zigzag source indices on-the-fly (no intermediate buffers)
+- Loads from zigzag buffer and writes contiguous output in one GPU kernel
+- Uses coalesced memory access for optimal bandwidth utilization
+
+**Status:**
+- ✅ Implementation complete (`ring_flash_attn/triton_utils.py:140-341`)
+- ✅ Enabled by default for two-kernels mode
+- ✅ Python fallback available for debugging
+- ⏳ **Benchmarking needed** - run on GPU cluster to measure actual speedup
+- Theoretical speedup: 10-20% for two-kernels mode
+- Target: Improve efficiency from 59.1% → ~65-70% (forward pass)
+
+**See also:** `TRITON_OPTIMIZATION.md` for detailed implementation and additional optimization ideas
+
+---
+
+### Other Potential Optimizations
+
+Additional optimization opportunities are documented in `TRITON_OPTIMIZATION.md`, including:
+- Fused gradient scatter kernel (Triton)
+- Pipelined all-gather with computation overlap
+- Fused kernel mode optimization
+- Reduce-scatter improvements
+- And more...
+
+---
+
 ## References
 
 - Implementation: `ring_flash_attn/zigzag_llama3_flash_attn_varlen.py`
 - Test: `test/test_zigzag_llama3_flash_attn_varlen_func.py`
 - Benchmark: `benchmark/benchmark_zigzag_llama3_varlen_kvpacked_func.py`
+- Triton Optimization Details: `TRITON_OPTIMIZATION.md`

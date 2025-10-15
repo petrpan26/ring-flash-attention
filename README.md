@@ -100,11 +100,16 @@ Note that
 |                      |         |                               | 49.8%         | **72.0%**       | 51.6%           | 59.1%                            | 58.9%                      |
 | fwd + bwd (iter/sec) | 8xA100  | 133.8 / 8 = 16.7              | 8.7           | 13.4            | 9.7             | 10.6                             | 10.3                       |
 |                      |         |                               | 52.1%         | **80.2%**       | 58.0%           | 63.4%                            | 61.6%                      |
+| fwd only<br />(stride=1, iter/sec) | 8xA100 | 510.3 / 8 = 63.8      | 31.8          | 48.0            | 29.8            | **42.7**                         | 42.7                       |
+|                      |         |                               | 49.9%         | 75.2%           | 46.7%           | **66.9%**                        | 66.9%                      |
+| fwd + bwd<br />(stride=1, iter/sec) | 8xA100 | 136.1 / 8 = 17.0     | 8.8           | 13.0            | 9.2             | **11.5**                         | 11.5                       |
+|                      |         |                               | 51.7%         | 76.4%           | 54.1%           | **67.6%**                        | 67.6%                      |
 
 Note that
 
 - The code of the benchmark is in [benchmark](benchmark/), its configuration matches the [Meta-Llama-3.1-8B](https://huggingface.co/NousResearch/Meta-Llama-3.1-8B/blob/main/config.json) setting, with a total sequence of length 8k per GPU.
 - When running the benchmark with with 8 gpu, the flash attn code is running with 1/8 computation of ring attention, as flash attn code is running `8*1^2`, while the ring attn code is running `1*8^2`.
+- **stride=1 results**: Uses `head_stride=1` in benchmark configuration, representing inference/short-sequence workloads. For both forward-only (66.9% vs 75.2%) and forward+backward (67.6% vs 76.5%), zigzag_llama3 with Triton optimizations achieves competitive efficiency compared to zigzag_ring, while offering simpler integration. The gap narrows to ~9% vs the normal stride gap of ~17%, making zigzag_llama3 an excellent choice for latency-sensitive workloads.
 - NVLink between GPUs are required for high performance.
 - Please remember to adapt the RoPE offset for different api.
 

@@ -130,7 +130,7 @@ def benchmark(
                 cu_seqlens_k_list[i % len(cu_seqlens_list)],
                 max_seqlen_q_list[i % len(cu_seqlens_list)],
                 max_seqlen_k_list[i % len(cu_seqlens_list)],
-                heads_k_stride=4,
+                heads_k_stride=1,
                 local_k_slice=local_k_slice_list[i % len(cu_seqlens_list)],
                 causal=causal,
                 window_size=(-1, -1),
@@ -312,10 +312,10 @@ if __name__ == "__main__":
     )
 
     for use_fused_fwd, use_fused_bwd, mode_name in [
-        (False, False, "Two-Kernels Forward, Two-Kernels Backward"),
-        (False, True, "Two-Kernels Forward, Fused Backward"),
-        (True, False, "Fused Forward, Two-Kernels Backward"),
-        (True, True, "Fused Forward, Fused Backward"),
+        (False, False, "Two-Kernels Forward, Two-Kernels Backward (Triton Optimized)"),
+        (False, True, "Two-Kernels Forward, Fused Backward (Triton Optimized)"),
+        (True, False, "Fused Forward, Two-Kernels Backward (Python Fallback)"),
+        (True, True, "Fused Forward, Fused Backward (Python Fallback)"),
     ]:
         torch.cuda.empty_cache()
         if rank == 0:
