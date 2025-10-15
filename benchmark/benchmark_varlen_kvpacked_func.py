@@ -16,6 +16,9 @@ def benchmark(
     f,
     use_double_cu_seqlens,
     use_llama3=False,
+    use_zigzag_llama3=False,
+    use_fused_fwd=False,
+    use_fused_bwd=False,
     num_iter=100,
     forward_only=True,
     log=True,
@@ -61,7 +64,74 @@ def benchmark(
         ),
     ]
 
-    if use_llama3:
+    if use_zigzag_llama3:
+        # For zigzag_llama3: broadcast data and extract local zigzag portions
+        def extract_local_zigzag(value, cu_seqlens, rank, world_size):
+            """Extract local zigzag-distributed portion for this rank."""
+            local_values = []
+            for i in range(len(cu_seqlens) - 1):
+                start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+                seq_len = end - start
+                assert seq_len % (2 * world_size) == 0, \
+                    f"Sequence {i} length {seq_len} not divisible by 2*world_size={2*world_size}"
+                seq_data = value[start:end]
+                local_chunks = seq_data.chunk(2 * world_size, dim=0)
+                local_values.extend([
+                    local_chunks[rank].detach().clone(),
+                    local_chunks[2 * world_size - 1 - rank].detach().clone(),
+                ])
+            return torch.cat(local_values, dim=0).contiguous()
+
+        # Broadcast full sequences
+        dist.broadcast(q, src=0)
+        dist.broadcast(kv, src=0)
+        dist.broadcast(dout, src=0)
+
+        # Prepare parameters for each cu_seqlens configuration
+        zigzag_q_list = []
+        zigzag_kv_list = []
+        zigzag_dout_list = []
+        cu_seqlens_q_list = []
+        cu_seqlens_k_list = []
+        max_seqlen_q_list = []
+        max_seqlen_k_list = []
+        local_k_slice_list = []
+
+        for cu_seqlens in cu_seqlens_list:
+            # Extract local zigzag portions
+            local_q = extract_local_zigzag(q, cu_seqlens, rank, world_size)
+            local_kv = extract_local_zigzag(kv, cu_seqlens, rank, world_size)
+            local_dout = extract_local_zigzag(dout, cu_seqlens, rank, world_size)
+            local_q.requires_grad = True
+            local_kv.requires_grad = True
+
+            zigzag_q_list.append(local_q)
+            zigzag_kv_list.append(local_kv)
+            zigzag_dout_list.append(local_dout)
+
+            # Calculate local cu_seqlens_q
+            local_seqlens = []
+            offset = 0
+            for i in range(len(cu_seqlens) - 1):
+                seq_len = (cu_seqlens[i+1] - cu_seqlens[i]).item()
+                local_seq_len = seq_len // world_size
+                local_seqlens.append(offset)
+                offset += local_seq_len
+            local_seqlens.append(offset)
+            local_cu_seqlens_q = torch.tensor(local_seqlens, dtype=torch.int32, device=device)
+            cu_seqlens_q_list.append(local_cu_seqlens_q)
+
+            # Global cu_seqlens_k and prepare llama3 parameters
+            cu_seqlens_k = cu_seqlens * world_size
+            _, _, max_seqlen_q, max_seqlen_k, local_k_slice = llama3_flash_attn_prepare_cu_seqlens(
+                cu_seqlens_k, causal, rank, world_size
+            )
+            cu_seqlens_k_list.append(cu_seqlens_k)
+            max_seqlen_q_list.append(max_seqlen_q)
+            max_seqlen_k_list.append(max_seqlen_k)
+            local_k_slice_list.append(local_k_slice)
+
+    elif use_llama3:
         cu_seqlens_q_list = []
         cu_seqlens_k_list = []
         max_seqlen_q_list = []
@@ -122,7 +192,27 @@ def benchmark(
     begin.record()
 
     def wrapper(i: int):
-        if use_llama3:
+        if use_zigzag_llama3:
+            idx = i % len(cu_seqlens_list)
+            return f(
+                zigzag_q_list[idx],
+                zigzag_kv_list[idx],
+                cu_seqlens_q_list[idx],
+                cu_seqlens_k_list[idx],
+                max_seqlen_q_list[idx],
+                max_seqlen_k_list[idx],
+                heads_k_stride=num_kv_heads,
+                local_k_slice=local_k_slice_list[idx],
+                causal=causal,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=deterministic,
+                return_attn_probs=False,
+                use_fused_kernel_forward=use_fused_fwd,
+                use_fused_kernel_backward=use_fused_bwd,
+                n_chunks=2,
+            )
+        elif use_llama3:
             return f(
                 q,
                 kv,
@@ -171,10 +261,17 @@ def benchmark(
                 _ = wrapper(i)
     else:
         for i in range(num_iter):
-            q.grad = None
-            kv.grad = None
-            out = wrapper(i)
-            out.backward(dout)
+            if use_zigzag_llama3:
+                idx = i % len(cu_seqlens_list)
+                zigzag_q_list[idx].grad = None
+                zigzag_kv_list[idx].grad = None
+                out = wrapper(i)
+                out.backward(zigzag_dout_list[idx])
+            else:
+                q.grad = None
+                kv.grad = None
+                out = wrapper(i)
+                out.backward(dout)
             if profile:
                 profiler.step()
     end = torch.cuda.Event(enable_timing=True)
@@ -259,59 +356,8 @@ if __name__ == "__main__":
         )
 
     # Benchmark zigzag_llama3_flash_attn with all 4 kernel mode combinations
-    # This requires special data preparation (zigzag extraction)
-    def extract_local_zigzag(value, cu_seqlens, rank, world_size):
-        """Extract local zigzag-distributed portion for this rank."""
-        local_values = []
-        for i in range(len(cu_seqlens) - 1):
-            start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
-            local_value = value[start:end].chunk(2 * world_size, dim=0)
-            local_values.extend([
-                local_value[rank].detach().clone(),
-                local_value[2 * world_size - 1 - rank].detach().clone(),
-            ])
-        return torch.cat(local_values, dim=0).contiguous()
-
-    # Prepare data for zigzag_llama3
-    # To match other benchmarks: each rank processes 8192 tokens
-    # So total tokens = 8192 * world_size
-    seqlen_per_rank = 1024 * 8
-    world_size = dist.get_world_size()
-    total_seqlen = seqlen_per_rank * world_size
-    num_heads = 32
-    num_kv_heads = 8
-    head_dim = 128
-    device = torch.device(f"cuda:{rank}")
-    dtype = torch.bfloat16
-
-    # Create full sequences and broadcast
-    q_full = torch.randn(total_seqlen, num_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
-    kv_full = torch.randn(total_seqlen, 2, num_kv_heads, head_dim, device=device, dtype=dtype, requires_grad=True)
-    dout_full = torch.randn(total_seqlen, num_heads, head_dim, device=device, dtype=dtype)
-
-    dist.broadcast(q_full, src=0)
-    dist.broadcast(kv_full, src=0)
-    dist.broadcast(dout_full, src=0)
-
-    cu_seqlens_single = torch.tensor([0, total_seqlen], device=device, dtype=torch.int32)
-
-    # Extract local zigzag portions
-    local_q = extract_local_zigzag(q_full, cu_seqlens_single, rank, dist.get_world_size())
-    local_kv = extract_local_zigzag(kv_full, cu_seqlens_single, rank, dist.get_world_size())
-    local_dout = extract_local_zigzag(dout_full, cu_seqlens_single, rank, dist.get_world_size())
-    local_q.requires_grad = True
-    local_kv.requires_grad = True
-
-    # Prepare local cu_seqlens for Q
-    # Each rank gets seqlen_per_rank tokens after zigzag extraction
-    local_cu_seqlens_q = torch.tensor([0, seqlen_per_rank], dtype=torch.int32, device=device)
-
-    # Prepare parameters
-    _, _, max_seqlen_q, max_seqlen_k, local_k_slice = llama3_flash_attn_prepare_cu_seqlens(
-        cu_seqlens_single, True, rank, dist.get_world_size()
-    )
-
-    for use_fused_fwd, use_fused_bwd, mode_name in [
+    # Uses the shared benchmark() function with use_zigzag_llama3=True
+    for fused_fwd, fused_bwd, mode_name in [
         (False, False, "Two-Kernels Forward, Two-Kernels Backward (Triton Optimized)"),
         (False, True, "Two-Kernels Forward, Fused Backward (Triton Optimized)"),
         (True, False, "Fused Forward, Two-Kernels Backward (Python Fallback)"),
@@ -321,81 +367,26 @@ if __name__ == "__main__":
         if rank == 0:
             print(f"# zigzag_llama3_flash_attn_varlen_kvpacked_func ({mode_name})")
 
-        # Warmup
-        with torch.no_grad() if forward_only else torch.enable_grad():
-            for _ in range(10):
-                local_q.grad = None if not forward_only else None
-                local_kv.grad = None if not forward_only else None
-                out = zigzag_llama3_flash_attn_varlen_kvpacked_func(
-                    local_q, local_kv,
-                    local_cu_seqlens_q,
-                    cu_seqlens_single,
-                    max_seqlen_q, max_seqlen_k,
-                    heads_k_stride=num_kv_heads,
-                    local_k_slice=local_k_slice,
-                    causal=True,
-                    window_size=(-1, -1),
-                    alibi_slopes=None,
-                    deterministic=False,
-                    return_attn_probs=False,
-                    use_fused_kernel_forward=use_fused_fwd,
-                    use_fused_kernel_backward=use_fused_bwd,
-                    n_chunks=2,
-                )
-                if not forward_only:
-                    out.backward(local_dout)
-
-        # Actual benchmark
-        begin = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        begin.record()
-
-        if forward_only:
-            with torch.no_grad():
-                for _ in range(num_iter):
-                    out = zigzag_llama3_flash_attn_varlen_kvpacked_func(
-                        local_q, local_kv,
-                        local_cu_seqlens_q,
-                        cu_seqlens_single,
-                        max_seqlen_q, max_seqlen_k,
-                        heads_k_stride=num_kv_heads,
-                        local_k_slice=local_k_slice,
-                        causal=True,
-                        window_size=(-1, -1),
-                        alibi_slopes=None,
-                        deterministic=False,
-                        return_attn_probs=False,
-                        use_fused_kernel_forward=use_fused_fwd,
-                        use_fused_kernel_backward=use_fused_bwd,
-                        n_chunks=2,
-                    )
-        else:
-            for _ in range(num_iter):
-                local_q.grad = None
-                local_kv.grad = None
-                out = zigzag_llama3_flash_attn_varlen_kvpacked_func(
-                    local_q, local_kv,
-                    local_cu_seqlens_q,
-                    cu_seqlens_single,
-                    max_seqlen_q, max_seqlen_k,
-                    heads_k_stride=num_kv_heads,
-                    local_k_slice=local_k_slice,
-                    causal=True,
-                    window_size=(-1, -1),
-                    alibi_slopes=None,
-                    deterministic=False,
-                    return_attn_probs=False,
-                    use_fused_kernel_forward=use_fused_fwd,
-                    use_fused_kernel_backward=use_fused_bwd,
-                    n_chunks=2,
-                )
-                out.backward(local_dout)
-
-        end.record()
-        torch.cuda.synchronize(device=device)
-        time = begin.elapsed_time(end) / 1000.0
-
-        if rank == 0:
-            print(f"{num_iter / time} iter/s, {time} sec")
+        benchmark(
+            zigzag_llama3_flash_attn_varlen_kvpacked_func,
+            use_double_cu_seqlens=True,
+            use_zigzag_llama3=True,
+            use_fused_fwd=fused_fwd,
+            use_fused_bwd=fused_bwd,
+            forward_only=forward_only,
+            num_iter=num_iter,
+            log=False,
+        )
+        benchmark(
+            zigzag_llama3_flash_attn_varlen_kvpacked_func,
+            use_double_cu_seqlens=True,
+            use_zigzag_llama3=True,
+            use_fused_fwd=fused_fwd,
+            use_fused_bwd=fused_bwd,
+            forward_only=forward_only,
+            num_iter=num_iter,
+            log=True,
+            profile=profile,
+        )
 
     dist.destroy_process_group()
