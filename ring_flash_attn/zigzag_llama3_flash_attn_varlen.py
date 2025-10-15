@@ -104,9 +104,8 @@ def rearrange_kv_from_zigzag_to_contiguous(
             chunk = kv_per_rank[:, rank, start_in_rank:end_in_rank]
             contiguous_chunks.append(chunk)
 
-            # Update offset only after extracting the second chunk from this rank
-            if not is_first_chunk or chunk_idx == rank:
-                offset_per_rank[rank] = end_in_rank
+            # Always update offset after extracting each chunk
+            offset_per_rank[rank] = end_in_rank
 
     # Concatenate all chunks
     kv_contiguous = torch.cat(contiguous_chunks, dim=1)
