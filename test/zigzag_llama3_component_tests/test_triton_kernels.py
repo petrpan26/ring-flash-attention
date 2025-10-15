@@ -96,14 +96,20 @@ def test_extract_zigzag_kv_slices_single_sequence():
         print(f"  V max diff: {v_diff.max().item():.6e}")
         print(f"  V mean diff: {v_diff.mean().item():.6e}")
 
-    # Should be exactly equal (no numerical errors in indexing)
-    assert torch.allclose(k_triton, k_python, rtol=0, atol=0), \
-        f"K mismatch: max diff = {k_diff.max().item()}"
-    assert torch.allclose(v_triton, v_python, rtol=0, atol=0), \
-        f"V mismatch: max diff = {v_diff.max().item()}"
+    # Collect errors instead of asserting
+    errors = []
+    if not torch.allclose(k_triton, k_python, rtol=0, atol=0):
+        errors.append(f"K mismatch: max diff = {k_diff.max().item()}")
+    if not torch.allclose(v_triton, v_python, rtol=0, atol=0):
+        errors.append(f"V mismatch: max diff = {v_diff.max().item()}")
 
     if rank == 0:
-        print("  ✓ PASSED")
+        if errors:
+            print("  ✗ FAILED")
+        else:
+            print("  ✓ PASSED")
+
+    return errors
 
 
 def test_extract_zigzag_kv_slices_multiple_sequences():
@@ -178,11 +184,20 @@ def test_extract_zigzag_kv_slices_multiple_sequences():
         print(f"  K max diff: {k_diff.max().item():.6e}")
         print(f"  V max diff: {v_diff.max().item():.6e}")
 
-    assert torch.allclose(k_triton, k_python, rtol=0, atol=0)
-    assert torch.allclose(v_triton, v_python, rtol=0, atol=0)
+    # Collect errors instead of asserting
+    errors = []
+    if not torch.allclose(k_triton, k_python, rtol=0, atol=0):
+        errors.append(f"K mismatch: max diff = {k_diff.max().item()}")
+    if not torch.allclose(v_triton, v_python, rtol=0, atol=0):
+        errors.append(f"V mismatch: max diff = {v_diff.max().item()}")
 
     if rank == 0:
-        print("  ✓ PASSED")
+        if errors:
+            print("  ✗ FAILED")
+        else:
+            print("  ✓ PASSED")
+
+    return errors
 
 
 def test_extract_zigzag_kv_slices_late_chunks():
@@ -242,11 +257,20 @@ def test_extract_zigzag_kv_slices_late_chunks():
         print(f"  K max diff: {k_diff.max().item():.6e}")
         print(f"  V max diff: {v_diff.max().item():.6e}")
 
-    assert torch.allclose(k_triton, k_python, rtol=0, atol=0)
-    assert torch.allclose(v_triton, v_python, rtol=0, atol=0)
+    # Collect errors instead of asserting
+    errors = []
+    if not torch.allclose(k_triton, k_python, rtol=0, atol=0):
+        errors.append(f"K mismatch: max diff = {k_diff.max().item()}")
+    if not torch.allclose(v_triton, v_python, rtol=0, atol=0):
+        errors.append(f"V mismatch: max diff = {v_diff.max().item()}")
 
     if rank == 0:
-        print("  ✓ PASSED")
+        if errors:
+            print("  ✗ FAILED")
+        else:
+            print("  ✓ PASSED")
+
+    return errors
 
 
 # ============================================================================
@@ -314,14 +338,20 @@ def test_scatter_grad_to_zigzag_single_sequence():
         print(f"  dV max diff: {dv_diff.max().item():.6e}")
         print(f"  dV mean diff: {dv_diff.mean().item():.6e}")
 
-    # Should be exactly equal
-    assert torch.allclose(grad_zigzag_triton_dk, grad_python_dk, rtol=0, atol=0), \
-        f"dK mismatch: max diff = {dk_diff.max().item()}"
-    assert torch.allclose(grad_zigzag_triton_dv, grad_python_dv, rtol=0, atol=0), \
-        f"dV mismatch: max diff = {dv_diff.max().item()}"
+    # Collect errors instead of asserting
+    errors = []
+    if not torch.allclose(grad_zigzag_triton_dk, grad_python_dk, rtol=0, atol=0):
+        errors.append(f"dK mismatch: max diff = {dk_diff.max().item()}")
+    if not torch.allclose(grad_zigzag_triton_dv, grad_python_dv, rtol=0, atol=0):
+        errors.append(f"dV mismatch: max diff = {dv_diff.max().item()}")
 
     if rank == 0:
-        print("  ✓ PASSED")
+        if errors:
+            print("  ✗ FAILED")
+        else:
+            print("  ✓ PASSED")
+
+    return errors
 
 
 def test_scatter_grad_to_zigzag_multiple_sequences():
@@ -389,11 +419,20 @@ def test_scatter_grad_to_zigzag_multiple_sequences():
         print(f"  dK max diff: {dk_diff.max().item():.6e}")
         print(f"  dV max diff: {dv_diff.max().item():.6e}")
 
-    assert torch.allclose(grad_zigzag_triton_dk, grad_python_dk, rtol=0, atol=0)
-    assert torch.allclose(grad_zigzag_triton_dv, grad_python_dv, rtol=0, atol=0)
+    # Collect errors instead of asserting
+    errors = []
+    if not torch.allclose(grad_zigzag_triton_dk, grad_python_dk, rtol=0, atol=0):
+        errors.append(f"dK mismatch: max diff = {dk_diff.max().item()}")
+    if not torch.allclose(grad_zigzag_triton_dv, grad_python_dv, rtol=0, atol=0):
+        errors.append(f"dV mismatch: max diff = {dv_diff.max().item()}")
 
     if rank == 0:
-        print("  ✓ PASSED")
+        if errors:
+            print("  ✗ FAILED")
+        else:
+            print("  ✓ PASSED")
+
+    return errors
 
 
 # ============================================================================
@@ -405,7 +444,7 @@ def test_triton_kernel_performance():
     rank, world_size, device = setup_distributed()
 
     if rank != 0:
-        return  # Only benchmark on rank 0
+        return []  # Only benchmark on rank 0
 
     # Configuration
     seq_len = 8192
@@ -473,9 +512,15 @@ def test_triton_kernel_performance():
     print(f"  Python reference: {python_time:.3f} ms")
     print(f"  Speedup: {speedup:.2f}x")
 
-    # Should be faster
-    assert speedup > 1.0, f"Triton kernel slower than Python! Speedup: {speedup:.2f}x"
-    print("  ✓ PASSED (Triton is faster)")
+    # Collect errors instead of asserting
+    errors = []
+    if speedup <= 1.0:
+        errors.append(f"Triton kernel slower than Python! Speedup: {speedup:.2f}x")
+        print("  ✗ FAILED (Triton is slower)")
+    else:
+        print("  ✓ PASSED (Triton is faster)")
+
+    return errors
 
 
 # ============================================================================
@@ -486,37 +531,69 @@ def main():
     """Run all tests."""
     setup_distributed()
 
+    # Dictionary to collect all test failures
+    test_failures = {}
+
     try:
         # Test extract_zigzag_kv_slice_kernel
         print("\n" + "="*70)
         print("Testing: extract_zigzag_kv_slice_kernel")
         print("="*70)
 
-        test_extract_zigzag_kv_slices_single_sequence()
-        test_extract_zigzag_kv_slices_multiple_sequences()
-        test_extract_zigzag_kv_slices_late_chunks()
+        errors = test_extract_zigzag_kv_slices_single_sequence()
+        if errors:
+            test_failures["test_extract_zigzag_kv_slices_single_sequence"] = errors
+
+        errors = test_extract_zigzag_kv_slices_multiple_sequences()
+        if errors:
+            test_failures["test_extract_zigzag_kv_slices_multiple_sequences"] = errors
+
+        errors = test_extract_zigzag_kv_slices_late_chunks()
+        if errors:
+            test_failures["test_extract_zigzag_kv_slices_late_chunks"] = errors
 
         # Test scatter_grad_to_zigzag_kernel
         print("\n" + "="*70)
         print("Testing: scatter_grad_to_zigzag_kernel")
         print("="*70)
 
-        test_scatter_grad_to_zigzag_single_sequence()
-        test_scatter_grad_to_zigzag_multiple_sequences()
+        errors = test_scatter_grad_to_zigzag_single_sequence()
+        if errors:
+            test_failures["test_scatter_grad_to_zigzag_single_sequence"] = errors
+
+        errors = test_scatter_grad_to_zigzag_multiple_sequences()
+        if errors:
+            test_failures["test_scatter_grad_to_zigzag_multiple_sequences"] = errors
 
         # Performance test
         print("\n" + "="*70)
         print("Performance Benchmarks")
         print("="*70)
 
-        test_triton_kernel_performance()
+        errors = test_triton_kernel_performance()
+        if errors:
+            test_failures["test_triton_kernel_performance"] = errors
 
         # Summary
         rank = dist.get_rank()
         if rank == 0:
             print("\n" + "="*70)
-            print("ALL TESTS PASSED! ✓")
-            print("="*70)
+            if test_failures:
+                print("TEST FAILURES SUMMARY")
+                print("="*70)
+                for test_name, errors in test_failures.items():
+                    print(f"\n{test_name}:")
+                    for error in errors:
+                        print(f"  - {error}")
+                print("\n" + "="*70)
+                print(f"FAILED: {len(test_failures)} test(s) failed ✗")
+                print("="*70)
+                # Exit with error code
+                import sys
+                sys.exit(1)
+            else:
+                print("ALL TESTS PASSED! ✓")
+                print("="*70)
 
     finally:
         teardown_distributed()
