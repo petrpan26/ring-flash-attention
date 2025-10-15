@@ -373,6 +373,9 @@ def execute_two_kernels_mode(
 
     Simpler approach: Run attention separately for each Q group.
 
+    OPTIMIZATION: Extract K,V only once for the maximum group, then slice for smaller groups.
+    Since late group contains early group (e.g., [0-7] contains [0-3]), we avoid redundant extraction.
+
     Args:
         kv_buffer: [2, total_tokens, nheads_k, head_dim] - zigzag interleaved buffer
         use_triton_kernel: If True, use Triton kernel to extract slices directly.
@@ -386,18 +389,27 @@ def execute_two_kernels_mode(
     out_chunks = []
     lse_chunks = []
 
-    for group_idx, (q_group, cu_seqlens_q_group) in enumerate(zip(chunk_q_list, chunk_cu_seqlens_q_list)):
-        if q_group.shape[0] == 0:
-            # Empty group, skip
-            continue
+    # OPTIMIZATION: Extract K,V only once for the largest group
+    # Find the group with maximum K,V requirements
+    max_kv_group_idx = -1
+    max_kv_size = 0
+    for group_idx, (seq_ranges, _) in enumerate(kv_slices):
+        total_size = sum(end - start for start, end in seq_ranges)
+        if total_size > max_kv_size:
+            max_kv_size = total_size
+            max_kv_group_idx = group_idx
 
-        seq_ranges, cu_seqlens_k_slice = kv_slices[group_idx]
+    # Extract K,V for the maximum group only
+    k_full = None
+    v_full = None
+    if max_kv_group_idx >= 0:
+        seq_ranges_max, cu_seqlens_k_slice_max = kv_slices[max_kv_group_idx]
 
         if use_triton_kernel:
             # Use Triton kernel to extract K,V slices directly from zigzag buffer
             # Build seq_ranges_with_chunk_idx: [(start, end, max_chunk_idx), ...]
             seq_ranges_with_chunk_idx = []
-            for seq_idx, (start, end) in enumerate(seq_ranges):
+            for seq_idx, (start, end) in enumerate(seq_ranges_max):
                 # Calculate max_chunk_idx for this sequence
                 seq_start_global = cu_seqlens_k[seq_idx].item()
                 seq_end_global = cu_seqlens_k[seq_idx + 1].item()
@@ -412,7 +424,7 @@ def execute_two_kernels_mode(
                 seq_ranges_with_chunk_idx.append((start, end, max_chunk_idx))
 
             nheads_k = kv_buffer.shape[2]
-            k_slice, v_slice = extract_zigzag_kv_slices_for_group(
+            k_full, v_full = extract_zigzag_kv_slices_for_group(
                 kv_buffer,
                 seq_ranges_with_chunk_idx,
                 cu_seqlens_k,
@@ -428,12 +440,32 @@ def execute_two_kernels_mode(
             # Extract K,V slices for each sequence and concatenate
             k_slices = []
             v_slices = []
-            for start, end in seq_ranges:
+            for start, end in seq_ranges_max:
                 k_slices.append(kv_contiguous[0, start:end])
                 v_slices.append(kv_contiguous[1, start:end])
 
-            k_slice = torch.cat(k_slices, dim=0)  # [total_k_tokens, heads, dim]
-            v_slice = torch.cat(v_slices, dim=0)  # [total_v_tokens, heads, dim]
+            k_full = torch.cat(k_slices, dim=0)  # [total_k_tokens, heads, dim]
+            v_full = torch.cat(v_slices, dim=0)  # [total_v_tokens, heads, dim]
+
+    # Now process each group, slicing from the full K,V buffer
+    for group_idx, (q_group, cu_seqlens_q_group) in enumerate(zip(chunk_q_list, chunk_cu_seqlens_q_list)):
+        if q_group.shape[0] == 0:
+            # Empty group, skip
+            continue
+
+        seq_ranges, cu_seqlens_k_slice = kv_slices[group_idx]
+
+        # Slice K,V for this group from the full buffer
+        if group_idx == max_kv_group_idx:
+            # This is the maximum group, use full K,V
+            k_slice = k_full
+            v_slice = v_full
+        else:
+            # This is a smaller group, slice from the full K,V
+            # Calculate how many tokens we need for this group
+            total_tokens_needed = sum(end - start for start, end in seq_ranges)
+            k_slice = k_full[:total_tokens_needed]
+            v_slice = v_full[:total_tokens_needed]
 
         # Calculate max_seqlen
         max_seqlen_q = (cu_seqlens_q_group[1:] - cu_seqlens_q_group[:-1]).max().item()
@@ -881,6 +913,8 @@ def backward_two_kernels_mode(
 
     Key: ACCUMULATE gradients for overlapping K,V regions.
 
+    OPTIMIZATION: Extract K,V only once for the maximum group, then slice for smaller groups.
+
     Args:
         kv_buffer: [2, total_tokens, nheads_k, head_dim] - zigzag interleaved buffer
         use_triton_kernel: If True, use Triton kernel for KV slicing (faster).
@@ -924,20 +958,26 @@ def backward_two_kernels_mode(
     dV_buffer = torch.zeros_like(dK_buffer)
     dq_groups = []
 
-    # Process each group
-    for group_idx, (dout_group, q_group, out_group, lse_group, cu_seqlens_q_group) in enumerate(zip(
-        dout_groups, q_groups, out_groups, lse_groups, chunk_cu_seqlens_q_list
-    )):
-        if q_group.shape[0] == 0:
-            # Empty group, skip
-            continue
+    # OPTIMIZATION: Extract K,V only once for the largest group
+    # Find the group with maximum K,V requirements
+    max_kv_group_idx = -1
+    max_kv_size = 0
+    for group_idx, (seq_ranges, _) in enumerate(kv_slices):
+        total_size = sum(end - start for start, end in seq_ranges)
+        if total_size > max_kv_size:
+            max_kv_size = total_size
+            max_kv_group_idx = group_idx
 
-        seq_ranges, cu_seqlens_k_slice = kv_slices[group_idx]
+    # Extract K,V for the maximum group only
+    k_full = None
+    v_full = None
+    if max_kv_group_idx >= 0:
+        seq_ranges_max, cu_seqlens_k_slice_max = kv_slices[max_kv_group_idx]
 
         if use_triton_kernel:
             # Use Triton kernel to extract K,V slices directly from zigzag buffer
             seq_ranges_with_chunk_idx = []
-            for seq_idx, (start, end) in enumerate(seq_ranges):
+            for seq_idx, (start, end) in enumerate(seq_ranges_max):
                 seq_start_global = cu_seqlens_k[seq_idx].item()
                 seq_end_global = cu_seqlens_k[seq_idx + 1].item()
                 seq_len = seq_end_global - seq_start_global
@@ -948,7 +988,7 @@ def backward_two_kernels_mode(
                 max_chunk_idx = (num_tokens_needed // chunk_size) - 1
                 seq_ranges_with_chunk_idx.append((start, end, max_chunk_idx))
 
-            k_slice, v_slice = extract_zigzag_kv_slices_for_group(
+            k_full, v_full = extract_zigzag_kv_slices_for_group(
                 kv_buffer,
                 seq_ranges_with_chunk_idx,
                 cu_seqlens_k,
@@ -961,12 +1001,34 @@ def backward_two_kernels_mode(
             kv_contiguous = rearrange_kv_from_zigzag_to_contiguous(kv_buffer, world_size, cu_seqlens_k)
             k_slices = []
             v_slices = []
-            for start, end in seq_ranges:
+            for start, end in seq_ranges_max:
                 k_slices.append(kv_contiguous[0, start:end])
                 v_slices.append(kv_contiguous[1, start:end])
 
-            k_slice = torch.cat(k_slices, dim=0).contiguous()
-            v_slice = torch.cat(v_slices, dim=0).contiguous()
+            k_full = torch.cat(k_slices, dim=0).contiguous()
+            v_full = torch.cat(v_slices, dim=0).contiguous()
+
+    # Process each group
+    for group_idx, (dout_group, q_group, out_group, lse_group, cu_seqlens_q_group) in enumerate(zip(
+        dout_groups, q_groups, out_groups, lse_groups, chunk_cu_seqlens_q_list
+    )):
+        if q_group.shape[0] == 0:
+            # Empty group, skip
+            continue
+
+        seq_ranges, cu_seqlens_k_slice = kv_slices[group_idx]
+
+        # Slice K,V for this group from the full buffer
+        if group_idx == max_kv_group_idx:
+            # This is the maximum group, use full K,V
+            k_slice = k_full
+            v_slice = v_full
+        else:
+            # This is a smaller group, slice from the full K,V
+            # Calculate how many tokens we need for this group
+            total_tokens_needed = sum(end - start for start, end in seq_ranges)
+            k_slice = k_full[:total_tokens_needed]
+            v_slice = v_full[:total_tokens_needed]
 
         # Calculate max_seqlen
         max_seqlen_q = (cu_seqlens_q_group[1:] - cu_seqlens_q_group[:-1]).max().item()
