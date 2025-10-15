@@ -150,6 +150,7 @@ def extract_zigzag_kv_slice_kernel(
     kv_type,  # 0 for K, 1 for V
     # Sequence info
     seq_idx,
+    seq_offset_in_zigzag,  # ADDED: Offset of this sequence within the zigzag buffer
     # Strides
     stride_kv_tokens,
     stride_kv_heads,
@@ -165,9 +166,11 @@ def extract_zigzag_kv_slice_kernel(
     Extract K or V slice from zigzag interleaved all-gathered buffer.
 
     Zigzag format: Each rank r contributes [chunk_r, chunk_(2*world_size-1-r)]
-    After all-gather: [r0_c0, r0_c7, r1_c1, r1_c6, r2_c2, r2_c5, r3_c3, r3_c4]
+    For multiple sequences, within each rank: [seq0_chunk_r, seq0_chunk_(2*ws-1-r), seq1_chunk_r, seq1_chunk_(2*ws-1-r), ...]
 
-    This kernel extracts chunks [0, 1, ..., max_chunk_idx] in contiguous order.
+    After all-gather: [r0_all_seqs, r1_all_seqs, r2_all_seqs, ...]
+
+    This kernel extracts chunks [0, 1, ..., max_chunk_idx] in contiguous order for one sequence.
     """
     pid = tl.program_id(axis=0)  # Token block
     head_idx = tl.program_id(axis=1)  # Head index
@@ -180,7 +183,7 @@ def extract_zigzag_kv_slice_kernel(
     total_chunks = 2 * world_size
     chunk_size = seq_len // total_chunks
 
-    # Calculate which token we're processing
+    # Calculate which token we're processing (within this sequence's output)
     token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
     # Only process tokens within the desired range [0, (max_chunk_idx+1)*chunk_size)
@@ -201,17 +204,21 @@ def extract_zigzag_kv_slice_kernel(
         2 * world_size - 1 - chunk_idx
     )
 
-    # Within that rank's contribution, is this the first or second chunk?
+    # Within that rank's contribution, is this the first or second chunk (for THIS sequence)?
     is_first_chunk = chunk_idx < world_size
 
     # Calculate position within the rank's local buffer
-    # First chunk from rank r: starts at rank * local_tokens_per_rank
-    # Second chunk from rank r: starts at rank * local_tokens_per_rank + chunk_size
-    chunk_offset_in_rank = tl.where(is_first_chunk, 0, chunk_size)
-    source_token_idx = rank_owner * local_tokens_per_rank + chunk_offset_in_rank + offset_in_chunk
+    # Each rank's contribution starts at: rank * local_tokens_per_rank
+    # Within the rank, this sequence starts at: seq_offset_in_zigzag (cumulative tokens from previous seqs)
+    # Within the sequence in this rank: first chunk at 0, second chunk at chunk_size
+    chunk_offset_in_seq = tl.where(is_first_chunk, 0, chunk_size)
 
-    # Add sequence offset (all sequences are concatenated)
-    source_token_idx = source_token_idx + seq_start_global
+    source_token_idx = (
+        rank_owner * local_tokens_per_rank +  # Start of this rank's contribution
+        seq_offset_in_zigzag +                 # Offset to this sequence within the rank
+        chunk_offset_in_seq +                  # Offset to the chunk within the sequence
+        offset_in_chunk                        # Offset within the chunk
+    )
 
     # Load from zigzag buffer and store to output
     # Load all dimensions for this head
@@ -277,6 +284,17 @@ def extract_zigzag_kv_slices_for_group(
 
     total_tokens = kv_buffer.shape[1]
     local_tokens_per_rank = total_tokens // world_size
+    total_chunks = 2 * world_size
+
+    # Calculate sequence offsets within each rank's zigzag buffer
+    # Each rank has all sequences interleaved: [seq0_chunks, seq1_chunks, ...]
+    # We need to know the cumulative offset for each sequence
+    seq_offsets_in_zigzag = [0]
+    num_seqs = len(cu_seqlens_global) - 1
+    for i in range(num_seqs):
+        seq_len = (cu_seqlens_global[i + 1] - cu_seqlens_global[i]).item()
+        tokens_per_rank_for_seq = 2 * (seq_len // total_chunks)  # Each rank has 2 chunks
+        seq_offsets_in_zigzag.append(seq_offsets_in_zigzag[-1] + tokens_per_rank_for_seq)
 
     BLOCK_SIZE = 128
 
@@ -284,6 +302,7 @@ def extract_zigzag_kv_slices_for_group(
     output_offset = 0
     for seq_idx, (start, end, max_chunk_idx) in enumerate(seq_ranges):
         num_tokens = end - start
+        seq_offset_in_zigzag = seq_offsets_in_zigzag[seq_idx]
 
         # Grid: (num_token_blocks, nheads_k)
         grid = lambda META: (
@@ -302,6 +321,7 @@ def extract_zigzag_kv_slices_for_group(
                 local_tokens_per_rank,
                 0,  # K
                 seq_idx,
+                seq_offset_in_zigzag,  # ADDED
                 # KV buffer strides (first dim is K/V selector)
                 kv_buffer.stride(1),
                 kv_buffer.stride(2),
@@ -324,6 +344,7 @@ def extract_zigzag_kv_slices_for_group(
                 local_tokens_per_rank,
                 1,  # V
                 seq_idx,
+                seq_offset_in_zigzag,  # ADDED
                 # KV buffer strides
                 kv_buffer.stride(1),
                 kv_buffer.stride(2),
@@ -350,6 +371,8 @@ def scatter_grad_to_zigzag_kernel(
     # Parameters
     rank,
     world_size,
+    seq_idx,  # Which sequence we're processing
+    seq_offset_in_zigzag,  # Offset of this sequence in the local zigzag buffer
     # Strides
     stride_grad_cont_tokens,
     stride_grad_cont_heads,
@@ -375,11 +398,10 @@ def scatter_grad_to_zigzag_kernel(
     """
     pid_token = tl.program_id(axis=0)  # Token block
     pid_head = tl.program_id(axis=1)   # Head index
-    pid_seq = tl.program_id(axis=2)    # Sequence index
 
     # Load sequence info
-    seq_start_global = tl.load(CU_SEQLENS_GLOBAL + pid_seq)
-    seq_end_global = tl.load(CU_SEQLENS_GLOBAL + pid_seq + 1)
+    seq_start_global = tl.load(CU_SEQLENS_GLOBAL + seq_idx)
+    seq_end_global = tl.load(CU_SEQLENS_GLOBAL + seq_idx + 1)
     seq_len = seq_end_global - seq_start_global
 
     total_chunks = 2 * world_size
@@ -413,16 +435,8 @@ def scatter_grad_to_zigzag_kernel(
     )
 
     # Destination address in zigzag gradient (local buffer)
-    # Need to account for sequence offset in local buffer
-    # (previous sequences' tokens come first)
-    local_seq_offset = 0
-    for i in range(pid_seq):
-        prev_seq_start = tl.load(CU_SEQLENS_GLOBAL + i)
-        prev_seq_end = tl.load(CU_SEQLENS_GLOBAL + i + 1)
-        prev_seq_len = prev_seq_end - prev_seq_start
-        local_seq_offset += 2 * (prev_seq_len // total_chunks)
-
-    dest_token_idx = local_seq_offset + token_idx_local
+    # seq_offset_in_zigzag is the cumulative offset from previous sequences
+    dest_token_idx = seq_offset_in_zigzag + token_idx_local
 
     grad_zig_offset = (
         dest_token_idx[:, None] * stride_grad_zig_tokens +
@@ -457,13 +471,17 @@ def scatter_grad_to_zigzag(
     """
     total_tokens, nheads_k, head_dim = grad_contiguous.shape
     num_seqs = len(cu_seqlens_global) - 1
+    total_chunks = 2 * world_size
 
-    # Calculate local tokens (each rank gets 2 chunks per sequence)
+    # Calculate local tokens and sequence offsets (each rank gets 2 chunks per sequence)
     local_tokens = 0
+    seq_offsets_in_zigzag = [0]
     for i in range(num_seqs):
         seq_len = (cu_seqlens_global[i + 1] - cu_seqlens_global[i]).item()
-        chunk_size = seq_len // (2 * world_size)
-        local_tokens += 2 * chunk_size
+        chunk_size = seq_len // total_chunks
+        tokens_per_rank_for_seq = 2 * chunk_size
+        local_tokens += tokens_per_rank_for_seq
+        seq_offsets_in_zigzag.append(local_tokens)
 
     # Allocate output
     grad_zigzag = torch.empty(
@@ -477,12 +495,12 @@ def scatter_grad_to_zigzag(
     # Launch kernel for each sequence
     for seq_idx in range(num_seqs):
         seq_len = (cu_seqlens_global[seq_idx + 1] - cu_seqlens_global[seq_idx]).item()
-        local_tokens_per_seq = 2 * (seq_len // (2 * world_size))
+        local_tokens_per_seq = 2 * (seq_len // total_chunks)
+        seq_offset_in_zigzag = seq_offsets_in_zigzag[seq_idx]
 
         grid = lambda META: (
             triton.cdiv(local_tokens_per_seq, BLOCK_SIZE),
             nheads_k,
-            1,  # Process one sequence at a time
         )
 
         with torch.cuda.device(grad_contiguous.device.index):
@@ -492,7 +510,9 @@ def scatter_grad_to_zigzag(
                 cu_seqlens_global,
                 rank,
                 world_size,
-                # Contiguous gradstrides
+                seq_idx,  # ADDED
+                seq_offset_in_zigzag,  # ADDED
+                # Contiguous grad strides
                 grad_contiguous.stride(0),
                 grad_contiguous.stride(1),
                 grad_contiguous.stride(2),
