@@ -110,10 +110,10 @@ def main():
 
     # Test all 4 execution modes
     modes = [
-        (False, False, "Two-Kernels Forward, Two-Kernels Backward"),
-        (False, True, "Two-Kernels Forward, Fused Backward"),
-        (True, False, "Fused Forward, Two-Kernels Backward"),
-        (True, True, "Fused Forward, Fused Backward"),
+        (False, False, "Two-Kernels Forward, Two-Kernels Backward (Triton Kernel)"),
+        (False, True, "Two-Kernels Forward, Fused Backward (Triton Kernel)"),
+        (True, False, "Fused Forward, Two-Kernels Backward (Python Fallback)"),
+        (True, True, "Fused Forward, Fused Backward (Python Fallback)"),
     ]
 
     for use_fused_fwd, use_fused_bwd, mode_name in modes:
@@ -252,6 +252,9 @@ def main():
         print("\n" + "=" * 60)
         print("# All tests PASSED!")
         print("=" * 60)
+        print("\n# NOTE: Two-kernels modes use optimized Triton kernel (no rearrangement)")
+        print("#       Fused modes use Python fallback (with rearrangement)")
+        print("#       Both should give identical results to reference Flash Attention")
 
     dist.destroy_process_group()
 
