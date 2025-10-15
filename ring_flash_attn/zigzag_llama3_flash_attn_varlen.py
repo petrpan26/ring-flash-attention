@@ -114,7 +114,10 @@ def rearrange_kv_from_zigzag_to_contiguous(
 
 
 # Optimization #4: torch.compile for hot path functions
-@torch.compile(mode="reduce-overhead", fullgraph=False)
+# Note: This function uses .item() for dynamic control flow, which causes graph breaks.
+# Since it's primarily data reorganization (not compute-intensive), compiling provides
+# minimal benefit. The real performance gains come from Flash Attention kernels.
+# @torch.compile(mode="reduce-overhead", fullgraph=False)  # Disabled to avoid .item() warnings
 def split_q_by_zigzag_chunk_index(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -240,7 +243,10 @@ def split_q_by_zigzag_chunk_index(
 
 
 # Optimization #4: torch.compile for hot path functions
-@torch.compile(mode="reduce-overhead", fullgraph=False)
+# Note: This function uses .item() for dynamic control flow, which causes graph breaks.
+# Since it's primarily metadata computation (not compute-intensive), compiling provides
+# minimal benefit. The real performance gains come from Flash Attention kernels.
+# @torch.compile(mode="reduce-overhead", fullgraph=False)  # Disabled to avoid .item() warnings
 def compute_kv_slices_for_groups(
     cu_seqlens_k: torch.Tensor,
     chunk_idx_0: int,
