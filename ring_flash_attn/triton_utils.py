@@ -345,14 +345,11 @@ def extract_zigzag_kv_slices_for_group(
 def scatter_grad_to_zigzag_kernel(
     # Input/Output pointers
     GRAD_CONTIGUOUS,  # [total_tokens, nheads_k, head_dim] - contiguous gradient
-    GRAD_ZIGZAG,      # [total_tokens, nheads_k, head_dim] - zigzag output (for this rank)
+    GRAD_ZIGZAG,      # [local_tokens, nheads_k, head_dim] - zigzag output (for this rank)
     CU_SEQLENS_GLOBAL,  # [num_seqs + 1]
     # Parameters
-    chunk_idx,  # Which chunk this rank owns
+    rank,
     world_size,
-    local_tokens_per_rank,
-    seq_idx,
-    chunk_offset_in_seq,  # Where this chunk starts in the contiguous sequence
     # Strides
     stride_grad_cont_tokens,
     stride_grad_cont_heads,
@@ -365,51 +362,146 @@ def scatter_grad_to_zigzag_kernel(
     HEAD_DIM: tl.constexpr,
 ):
     """
+    Optimization #5: Fused gradient scatter kernel
+
     Scatter gradients from contiguous format back to zigzag interleaved format.
-    Used in backward pass.
+    This kernel is the reverse of extract_zigzag_kv_slice_kernel.
+
+    For each rank, we need to extract gradients for:
+    - chunk[rank] (early chunk)
+    - chunk[2*world_size - 1 - rank] (late chunk)
+
+    And concatenate them in zigzag interleaved format.
     """
-    pid = tl.program_id(axis=0)  # Token block
-    head_idx = tl.program_id(axis=1)  # Head index
+    pid_token = tl.program_id(axis=0)  # Token block
+    pid_head = tl.program_id(axis=1)   # Head index
+    pid_seq = tl.program_id(axis=2)    # Sequence index
 
     # Load sequence info
-    seq_start_global = tl.load(CU_SEQLENS_GLOBAL + seq_idx)
-    seq_end_global = tl.load(CU_SEQLENS_GLOBAL + seq_idx + 1)
+    seq_start_global = tl.load(CU_SEQLENS_GLOBAL + pid_seq)
+    seq_end_global = tl.load(CU_SEQLENS_GLOBAL + pid_seq + 1)
     seq_len = seq_end_global - seq_start_global
 
     total_chunks = 2 * world_size
     chunk_size = seq_len // total_chunks
 
-    # Token indices within this chunk
-    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = token_idx < chunk_size
+    # This rank owns two chunks
+    chunk_idx_0 = rank  # Early chunk
+    chunk_idx_1 = 2 * world_size - 1 - rank  # Late chunk
 
-    # Source position in contiguous gradient (relative to sequence start)
-    source_token_idx = chunk_offset_in_seq + token_idx
+    # Token indices within local buffer (2 chunks concatenated)
+    local_tokens_per_seq = 2 * chunk_size
+    token_idx_local = pid_token * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = token_idx_local < local_tokens_per_seq
 
-    # Destination position in zigzag buffer (local to this rank)
-    # This rank owns two chunks: chunk_idx and (2*world_size - 1 - chunk_idx)
-    # We need to determine if we're scattering to the first or second local chunk
-    is_first_chunk = chunk_idx < world_size
-    chunk_offset_in_local = tl.where(is_first_chunk, 0, chunk_size)
-    dest_token_idx = chunk_offset_in_local + token_idx
+    # Determine which chunk this local token belongs to
+    is_first_chunk = token_idx_local < chunk_size
+    chunk_idx = tl.where(is_first_chunk, chunk_idx_0, chunk_idx_1)
+    offset_in_chunk = tl.where(is_first_chunk, token_idx_local, token_idx_local - chunk_size)
 
-    # Load all dimensions for this head
+    # Source position in contiguous gradient
+    source_token_idx = seq_start_global + chunk_idx * chunk_size + offset_in_chunk
+
+    # Dimension indices
     dim_idx = tl.arange(0, HEAD_DIM)
 
     # Source address in contiguous gradient
     grad_cont_offset = (
         source_token_idx[:, None] * stride_grad_cont_tokens +
-        head_idx * stride_grad_cont_heads +
+        pid_head * stride_grad_cont_heads +
         dim_idx[None, :] * stride_grad_cont_dim
     )
 
-    # Destination address in zigzag gradient
+    # Destination address in zigzag gradient (local buffer)
+    # Need to account for sequence offset in local buffer
+    # (previous sequences' tokens come first)
+    local_seq_offset = 0
+    for i in range(pid_seq):
+        prev_seq_start = tl.load(CU_SEQLENS_GLOBAL + i)
+        prev_seq_end = tl.load(CU_SEQLENS_GLOBAL + i + 1)
+        prev_seq_len = prev_seq_end - prev_seq_start
+        local_seq_offset += 2 * (prev_seq_len // total_chunks)
+
+    dest_token_idx = local_seq_offset + token_idx_local
+
     grad_zig_offset = (
         dest_token_idx[:, None] * stride_grad_zig_tokens +
-        head_idx * stride_grad_zig_heads +
+        pid_head * stride_grad_zig_heads +
         dim_idx[None, :] * stride_grad_zig_dim
     )
 
-    # Load and accumulate (use atomic add for safety)
+    # Load and store (no atomic needed - each location written once)
     grad_data = tl.load(GRAD_CONTIGUOUS + grad_cont_offset, mask=mask[:, None], other=0.0)
-    tl.atomic_add(GRAD_ZIGZAG + grad_zig_offset, grad_data, mask=mask[:, None])
+    tl.store(GRAD_ZIGZAG + grad_zig_offset, grad_data, mask=mask[:, None])
+
+
+def scatter_grad_to_zigzag(
+    grad_contiguous: torch.Tensor,  # [total_tokens, nheads_k, head_dim]
+    cu_seqlens_global: torch.Tensor,  # [num_seqs + 1]
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """
+    Python wrapper for scatter_grad_to_zigzag_kernel.
+
+    Converts gradients from contiguous format back to zigzag interleaved format.
+
+    Args:
+        grad_contiguous: Gradients in contiguous format
+        cu_seqlens_global: Global sequence boundaries
+        rank: Current rank
+        world_size: Number of ranks
+
+    Returns:
+        grad_zigzag: Gradients in zigzag interleaved format [local_tokens, nheads_k, head_dim]
+    """
+    total_tokens, nheads_k, head_dim = grad_contiguous.shape
+    num_seqs = len(cu_seqlens_global) - 1
+
+    # Calculate local tokens (each rank gets 2 chunks per sequence)
+    local_tokens = 0
+    for i in range(num_seqs):
+        seq_len = (cu_seqlens_global[i + 1] - cu_seqlens_global[i]).item()
+        chunk_size = seq_len // (2 * world_size)
+        local_tokens += 2 * chunk_size
+
+    # Allocate output
+    grad_zigzag = torch.empty(
+        (local_tokens, nheads_k, head_dim),
+        dtype=grad_contiguous.dtype,
+        device=grad_contiguous.device
+    )
+
+    BLOCK_SIZE = 128
+
+    # Launch kernel for each sequence
+    for seq_idx in range(num_seqs):
+        seq_len = (cu_seqlens_global[seq_idx + 1] - cu_seqlens_global[seq_idx]).item()
+        local_tokens_per_seq = 2 * (seq_len // (2 * world_size))
+
+        grid = lambda META: (
+            triton.cdiv(local_tokens_per_seq, BLOCK_SIZE),
+            nheads_k,
+            1,  # Process one sequence at a time
+        )
+
+        with torch.cuda.device(grad_contiguous.device.index):
+            scatter_grad_to_zigzag_kernel[grid](
+                grad_contiguous,
+                grad_zigzag,
+                cu_seqlens_global,
+                rank,
+                world_size,
+                # Contiguous gradstrides
+                grad_contiguous.stride(0),
+                grad_contiguous.stride(1),
+                grad_contiguous.stride(2),
+                # Zigzag grad strides
+                grad_zigzag.stride(0),
+                grad_zigzag.stride(1),
+                grad_zigzag.stride(2),
+                BLOCK_SIZE=BLOCK_SIZE,
+                HEAD_DIM=head_dim,
+            )
+
+    return grad_zigzag

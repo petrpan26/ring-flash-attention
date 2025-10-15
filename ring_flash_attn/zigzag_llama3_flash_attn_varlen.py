@@ -114,6 +114,8 @@ def rearrange_kv_from_zigzag_to_contiguous(
     return kv_contiguous
 
 
+# Optimization #4: torch.compile for hot path functions
+@torch.compile(mode="reduce-overhead", fullgraph=False)
 def split_q_by_zigzag_chunk_index(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -238,6 +240,8 @@ def split_q_by_zigzag_chunk_index(
     return final_chunk_q_list, final_chunk_cu_seqlens_list, final_chunk_indices_list
 
 
+# Optimization #4: torch.compile for hot path functions
+@torch.compile(mode="reduce-overhead", fullgraph=False)
 def compute_kv_slices_for_groups(
     cu_seqlens_k: torch.Tensor,
     chunk_idx_0: int,
@@ -720,7 +724,8 @@ def zigzag_llama3_flash_attn_varlen_forward(
     nheads = q.shape[1]
     total_k, nheads_k, head_dim = k.shape
 
-    # Step 1: All-gather K,V (llama3-style)
+    # Step 1: Start all-gather K,V (llama3-style) - NON-BLOCKING
+    # Optimization #2: Pipeline all-gather with computation
     kv_buffer = torch.empty(
         (2, total_k * world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
@@ -733,19 +738,22 @@ def zigzag_llama3_flash_attn_varlen_forward(
     comm = Comm(process_group)
     comm.all_gather(kv_buffer[0], k_slice)
     comm.all_gather(kv_buffer[1], v_slice)
-    comm.wait()
+    # DON'T wait yet - overlap with computation!
 
-    # Step 2: Split local Q by global chunk index
+    # Step 2: Split local Q by global chunk index (OVERLAPPED with all-gather)
     chunk_q_list, chunk_cu_seqlens_q_list, chunk_indices_list = split_q_by_zigzag_chunk_index(
         q, cu_seqlens_q, world_size, rank, n_chunks=n_chunks
     )
 
-    # Step 3: Compute K,V slices for each group
+    # Step 3: Compute K,V slices for each group (OVERLAPPED with all-gather)
     chunk_idx_0 = rank
     chunk_idx_1 = 2 * world_size - 1 - rank
     kv_slices = compute_kv_slices_for_groups(
         cu_seqlens_k, chunk_idx_0, chunk_idx_1, world_size, n_chunks=n_chunks
     )
+
+    # Now wait for all-gather to complete
+    comm.wait()
 
     # Step 4: Execute attention
     if use_fused_kernel:
@@ -1017,23 +1025,40 @@ def backward_two_kernels_mode(
     dkv_interleaved = rearrange_grad_from_contiguous_to_zigzag(dkv_contiguous, world_size, cu_seqlens_k)
 
     # Reduce-scatter to get local gradients
+    # Optimization #3: Use reduce_scatter_tensor (newer, more efficient API)
     local_tokens = dkv_interleaved.shape[1] // world_size
+    nheads_k_used = dkv_interleaved.shape[2]
 
-    # Prepare lists for reduce_scatter
-    dk_scatter_list = []
-    dv_scatter_list = []
-    for r in range(world_size):
-        start = r * local_tokens
-        end = start + local_tokens
-        dk_scatter_list.append(dkv_interleaved[0, start:end].contiguous())
-        dv_scatter_list.append(dkv_interleaved[1, start:end].contiguous())
+    # Allocate output buffers
+    local_dk = torch.empty(
+        (local_tokens, nheads_k_used, head_dim),
+        dtype=dkv_interleaved.dtype,
+        device=dkv_interleaved.device
+    )
+    local_dv = torch.empty_like(local_dk)
 
-    # Reduce-scatter (sum operation)
-    local_dk = torch.zeros_like(k[:, :kv_contiguous.shape[2]])
-    local_dv = torch.zeros_like(v[:, :kv_contiguous.shape[2]])
+    # Optimization #7: Async reduce-scatter to overlap dK and dV communication
+    # Start dK reduce-scatter (non-blocking)
+    handle_dk = dist.reduce_scatter_tensor(
+        local_dk,
+        dkv_interleaved[0],
+        op=dist.ReduceOp.SUM,
+        group=process_group,
+        async_op=True
+    )
 
-    dist.reduce_scatter(local_dk, dk_scatter_list, op=dist.ReduceOp.SUM, group=process_group)
-    dist.reduce_scatter(local_dv, dv_scatter_list, op=dist.ReduceOp.SUM, group=process_group)
+    # Start dV reduce-scatter (can overlap with dK)
+    handle_dv = dist.reduce_scatter_tensor(
+        local_dv,
+        dkv_interleaved[1],
+        op=dist.ReduceOp.SUM,
+        group=process_group,
+        async_op=True
+    )
+
+    # Wait for both to complete
+    handle_dk.wait()
+    handle_dv.wait()
 
     # Expand back to full head dimension if needed
     if k.shape[1] > local_dk.shape[1]:
@@ -1220,20 +1245,41 @@ def backward_fused_kernel_mode(
     dkv_interleaved = rearrange_grad_from_contiguous_to_zigzag(dkv_contiguous, world_size, cu_seqlens_k)
 
     # Reduce-scatter
+    # Optimization #3: Use reduce_scatter_tensor (newer, more efficient API)
     local_tokens = dkv_interleaved.shape[1] // world_size
-    dk_scatter_list = []
-    dv_scatter_list = []
-    for r in range(world_size):
-        start = r * local_tokens
-        end = start + local_tokens
-        dk_scatter_list.append(dkv_interleaved[0, start:end].contiguous())
-        dv_scatter_list.append(dkv_interleaved[1, start:end].contiguous())
+    nheads_k_used = kv_contiguous.shape[2]
+    head_dim = kv_contiguous.shape[3]
 
-    local_dk = torch.zeros_like(k[:, :kv_contiguous.shape[2]])
-    local_dv = torch.zeros_like(v[:, :kv_contiguous.shape[2]])
+    # Allocate output buffers
+    local_dk = torch.empty(
+        (local_tokens, nheads_k_used, head_dim),
+        dtype=dkv_interleaved.dtype,
+        device=dkv_interleaved.device
+    )
+    local_dv = torch.empty_like(local_dk)
 
-    dist.reduce_scatter(local_dk, dk_scatter_list, op=dist.ReduceOp.SUM, group=process_group)
-    dist.reduce_scatter(local_dv, dv_scatter_list, op=dist.ReduceOp.SUM, group=process_group)
+    # Optimization #7: Async reduce-scatter to overlap dK and dV communication
+    # Start dK reduce-scatter (non-blocking)
+    handle_dk = dist.reduce_scatter_tensor(
+        local_dk,
+        dkv_interleaved[0],
+        op=dist.ReduceOp.SUM,
+        group=process_group,
+        async_op=True
+    )
+
+    # Start dV reduce-scatter (can overlap with dK)
+    handle_dv = dist.reduce_scatter_tensor(
+        local_dv,
+        dkv_interleaved[1],
+        op=dist.ReduceOp.SUM,
+        group=process_group,
+        async_op=True
+    )
+
+    # Wait for both to complete
+    handle_dk.wait()
+    handle_dv.wait()
 
     # Expand back to full head dimension if needed
     if k.shape[1] > local_dk.shape[1]:
@@ -1311,7 +1357,8 @@ def zigzag_llama3_flash_attn_varlen_backward(
     rank = dist.get_rank(process_group)
     total_k, nheads_k, head_dim = k.shape
 
-    # Step 1: All-gather K,V (same as forward)
+    # Step 1: Start all-gather K,V (same as forward) - NON-BLOCKING
+    # Optimization #2: Pipeline all-gather with computation
     kv_buffer = torch.empty(
         (2, total_k * world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
@@ -1324,6 +1371,10 @@ def zigzag_llama3_flash_attn_varlen_backward(
     comm = Comm(process_group)
     comm.all_gather(kv_buffer[0], k_slice)
     comm.all_gather(kv_buffer[1], v_slice)
+    # DON'T wait yet - can do prep work while waiting
+
+    # TODO: Could add more overlap here (e.g., prepare dout splits)
+    # For now, wait before backward computation
     comm.wait()
 
     # Step 2: Execute backward
