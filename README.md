@@ -75,7 +75,7 @@ Note that
 
 ## Performance Summary
 
-The following table summarizes the performance of the implemented APIs:
+### Batch API
 
 | batch api            | GPU     | theoretic<br />flash_attn     | ring_attn     | zigzag_ring     | stripe_attn     |
 | -------------------- | ------- | ----------------------------- | ------------- | --------------- | --------------- |
@@ -87,15 +87,19 @@ The following table summarizes the performance of the implemented APIs:
 |                      |         |                               | 51.4%         | **81.7%**       | 69.6%           |
 | fwd + bwd (iter/sec) | 8xA100  | 94.7 / 8 = 11.8               | 6.2           | 10.6            | 9.75            |
 |                      |         |                               | 52.5%         | **89.8%**       | 82.6%           |
-| **varlen api**       | **GPU** | **theoretic<br />flash_attn** | **ring_attn** | **zigzag_ring** | **llama3_attn** |
-| fwd only (iter/sec)  | 8xH800  | 852.4 / 8 = 106.6             | 52.4          | 74.8            | 60.8            |
-|                      |         |                               | 49.1%         | **70.2%**       | 57.0%           |
-| fwd + bwd (iter/sec) | 8xH800  | 225.4 / 8 = 28.2              | 14.4          | 21.4            | 16.4            |
-|                      |         |                               | 51.1%         | **75.9%**       | 58.1%           |
-| fwd only (iter/sec)  | 8xA100  | 532.3 / 8 = 66.5              | 33.1          | 47.9            | 34.3            |
-|                      |         |                               | 49.8%         | **72.0%**       | 51.6%           |
-| fwd + bwd (iter/sec) | 8xA100  | 133.8 / 8 = 16.7              | 8.7           | 13.4            | 9.7             |
-|                      |         |                               | 52.1%         | **80.2%**       | 58.0%           |
+
+### Varlen API
+
+| varlen api           | GPU     | theoretic<br />flash_attn     | ring_attn     | zigzag_ring     | llama3_attn     | zigzag_llama3<br />(two-kernels) | zigzag_llama3<br />(fused) |
+| -------------------- | ------- | ----------------------------- | ------------- | --------------- | --------------- | -------------------------------- | -------------------------- |
+| fwd only (iter/sec)  | 8xH800  | 852.4 / 8 = 106.6             | 52.4          | 74.8            | 60.8            | N/A                              | N/A                        |
+|                      |         |                               | 49.1%         | **70.2%**       | 57.0%           |                                  |                            |
+| fwd + bwd (iter/sec) | 8xH800  | 225.4 / 8 = 28.2              | 14.4          | 21.4            | 16.4            | N/A                              | N/A                        |
+|                      |         |                               | 51.1%         | **75.9%**       | 58.1%           |                                  |                            |
+| fwd only (iter/sec)  | 8xA100  | 532.3 / 8 = 66.5              | 33.1          | 47.9            | 34.3            | 39.3                             | 39.2                       |
+|                      |         |                               | 49.8%         | **72.0%**       | 51.6%           | 59.1%                            | 58.9%                      |
+| fwd + bwd (iter/sec) | 8xA100  | 133.8 / 8 = 16.7              | 8.7           | 13.4            | 9.7             | 10.6                             | 10.3                       |
+|                      |         |                               | 52.1%         | **80.2%**       | 58.0%           | 63.4%                            | 61.6%                      |
 
 Note that
 
