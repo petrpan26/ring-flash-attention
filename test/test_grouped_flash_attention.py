@@ -408,7 +408,9 @@ class TestGroupedFlashAttentionCorrectness:
                                        device=device, dtype=torch.int32)
 
         # Split into 2 groups with different K,V lengths
-        q_list = [q[:1000].clone(), q[1000:].clone()]
+        # Group 0: First 2 sequences (128 + 256 = 384 tokens)
+        # Group 1: Last 2 sequences (512 + 1024 = 1536 tokens, but we use 920 to fit in total)
+        q_list = [q[:384].clone(), q[384:1304].clone()]
 
         cu_seqlens_q_list = [
             torch.tensor([0, 128, 384], device=device, dtype=torch.int32),  # First 2 seqs

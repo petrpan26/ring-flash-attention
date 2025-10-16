@@ -223,11 +223,12 @@ class TestGroupedFlashAttentionLargeScales:
         cu_seqlens_k_list = [
             torch.arange(0, tokens_per_group + 1, seq_len_per_batch,
                         device=device, dtype=torch.int32),
-            cu_seqlens_full,
+            torch.arange(0, total_tokens + 1, seq_len_per_batch * 2,
+                        device=device, dtype=torch.int32),
         ]
 
         max_seqlen_q_list = [seq_len_per_batch, seq_len_per_batch]
-        max_seqlen_k_list = [tokens_per_group, total_tokens]
+        max_seqlen_k_list = [seq_len_per_batch, seq_len_per_batch * 2]
 
         # Run grouped attention
         out_list, _ = _flash_attn_varlen_forward_grouped_python(

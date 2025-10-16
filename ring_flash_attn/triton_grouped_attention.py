@@ -391,30 +391,26 @@ def triton_grouped_flash_attn_varlen_forward(
 
 
 # Autotuning configuration for optimal block sizes
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=2, num_stages=5),
-    ],
-    key=['max_seqlen_q', 'max_seqlen_k', 'head_dim'],
-)
-@triton.jit
-def grouped_flash_attention_fwd_kernel_autotuned(
-    # Same signature as grouped_flash_attention_fwd_kernel
-    # ... (omitted for brevity - would be identical)
-    # This is a placeholder showing how autotuning would be applied
-    pass
-):
-    """
-    Autotuned version of grouped flash attention kernel.
-
-    Triton will benchmark different block size configurations and select
-    the fastest one for the given input shapes.
-    """
-    pass
+# (This is a placeholder showing how autotuning would be applied in the future)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=4),
+#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=4),
+#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
+#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=2, num_stages=5),
+#     ],
+#     key=['max_seqlen_q', 'max_seqlen_k', 'head_dim'],
+# )
+# @triton.jit
+# def grouped_flash_attention_fwd_kernel_autotuned(...):
+#     """
+#     Autotuned version of grouped flash attention kernel.
+#
+#     Triton will benchmark different block size configurations and select
+#     the fastest one for the given input shapes.
+#     """
+#     pass
 
 
 def get_recommended_block_sizes(head_dim: int, max_seqlen_k: int) -> Tuple[int, int, int]:
