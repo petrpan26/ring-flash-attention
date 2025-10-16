@@ -6,26 +6,48 @@ This guide will help you test all three grouped flash attention implementations 
 
 ## 🎯 Quick Start (5 minutes)
 
+**Note:** For detailed setup including flash-attention fork, see `SETUP_GUIDE.md`
+
 ```bash
-# 1. Clone and checkout the branch
+# 1. Install flash-attention (for baseline comparison)
+pip install flash-attn --no-build-isolation  # Takes 5-10 min
+
+# 2. Clone and checkout the branch
 git clone https://github.com/petrpan26/ring-flash-attention.git
 cd ring-flash-attention
 git checkout feature/grouped-flash-attention
 
-# 2. Install dependencies
+# 3. Install dependencies
 pip install torch triton pytest
 
-# 3. Install this package
+# 4. Install this package
 pip install -e .
 
-# 4. Run quick test
+# 5. Run quick test
 python example_grouped_attention.py
 
-# 5. If that works, run full test suite
+# 6. If that works, run full test suite
 pytest test/test_grouped_flash_attention.py -v
 ```
 
 **Expected output:** All tests pass, grouped attention is 10-15% faster than baseline.
+
+### Want All 3 Implementations?
+
+To test Option A (CUDA) and Option B (Python wrapper) as well, you need the flash-attention fork:
+
+```bash
+# Install flash-attention fork (Option A & B)
+git clone https://github.com/petrpan26/flash-attention.git
+cd flash-attention
+git checkout feature/grouped-flash-attention
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"  # Multi-GPU support
+pip install -e . --no-build-isolation  # Takes 5-10 min
+
+# Then install ring-flash-attention (as above)
+```
+
+See `SETUP_GUIDE.md` for complete details on all setup options.
 
 ---
 
