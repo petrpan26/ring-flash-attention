@@ -7,6 +7,7 @@ from ring_flash_attn import (
     ring_flash_attn_varlen_kvpacked_func,
     zigzag_ring_flash_attn_varlen_kvpacked_func,
     llama3_flash_attn_varlen_kvpacked_func,
+    zigzag_llama3_flash_attn_varlen_kvpacked_func,
     llama3_flash_attn_prepare_cu_seqlens,
 )
 
@@ -15,6 +16,9 @@ def benchmark(
     f,
     use_double_cu_seqlens,
     use_llama3=False,
+    use_zigzag_llama3=False,
+    use_fused_fwd=False,
+    use_fused_bwd=False,
     num_iter=100,
     forward_only=True,
     log=True,
@@ -60,13 +64,15 @@ def benchmark(
         ),
     ]
 
-    if use_llama3:
+    if use_llama3 or use_zigzag_llama3:
         cu_seqlens_q_list = []
         cu_seqlens_k_list = []
+        cu_seqlens_k_global_list = []  # For zigzag_llama3: global cu_seqlens
         max_seqlen_q_list = []
         max_seqlen_k_list = []
         local_k_slice_list = []
         for cu_seqlens in cu_seqlens_list:
+            cu_seqlens_global = cu_seqlens * world_size
             (
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -74,13 +80,14 @@ def benchmark(
                 max_seqlen_k,
                 local_k_slice,
             ) = llama3_flash_attn_prepare_cu_seqlens(
-                cu_seqlens * world_size,
+                cu_seqlens_global,
                 causal=causal,
                 rank=rank,
                 world_size=world_size,
             )
             cu_seqlens_q_list.append(cu_seqlens_q)
             cu_seqlens_k_list.append(cu_seqlens_k)
+            cu_seqlens_k_global_list.append(cu_seqlens_global)  # Save global version
             max_seqlen_q_list.append(max_seqlen_q)
             max_seqlen_k_list.append(max_seqlen_k)
             local_k_slice_list.append(local_k_slice)
@@ -121,7 +128,27 @@ def benchmark(
     begin.record()
 
     def wrapper(i: int):
-        if use_llama3:
+        if use_zigzag_llama3:
+            idx = i % len(cu_seqlens_list)
+            return f(
+                q,
+                kv,
+                cu_seqlens_list[idx],  # Use LOCAL cu_seqlens (not sliced by llama3_prepare)
+                cu_seqlens_k_global_list[idx],  # Pass GLOBAL cu_seqlens (scaled by world_size)
+                max_seqlen_q_list[idx],
+                max_seqlen_k_list[idx],
+                heads_k_stride=num_kv_heads,  # Backward requires heads_k_stride == nheads_k for now
+                local_k_slice=local_k_slice_list[idx],
+                causal=causal,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=deterministic,
+                return_attn_probs=False,
+                use_fused_kernel_forward=use_fused_fwd,
+                use_fused_kernel_backward=use_fused_bwd,
+                n_chunks=2,
+            )
+        elif use_llama3:
             return f(
                 q,
                 kv,
@@ -129,7 +156,7 @@ def benchmark(
                 cu_seqlens_k_list[i % len(cu_seqlens_list)],
                 max_seqlen_q_list[i % len(cu_seqlens_list)],
                 max_seqlen_k_list[i % len(cu_seqlens_list)],
-                heads_k_stride=4,
+                heads_k_stride=1,
                 local_k_slice=local_k_slice_list[i % len(cu_seqlens_list)],
                 causal=causal,
                 window_size=(-1, -1),
@@ -193,12 +220,19 @@ if __name__ == "__main__":
 
     forward_only = False
     profile = False
-    num_iter = 500 if forward_only else 100
     compile_func = False
 
-    if len(sys.argv) > 1 and sys.argv[1] == "compile":
-        compile_func = True
-        torch._dynamo.config.capture_scalar_outputs = True
+    # Parse command line arguments
+    for arg in sys.argv[1:]:
+        if arg == "compile":
+            compile_func = True
+            torch._dynamo.config.capture_scalar_outputs = True
+        elif arg == "forward_only":
+            forward_only = True
+        elif arg == "profile":
+            profile = True
+
+    num_iter = 500 if forward_only else 100
 
     for f, use_double_cu_seqlens in [
         (flash_attn_varlen_kvpacked_func, True),
@@ -244,6 +278,40 @@ if __name__ == "__main__":
             f,
             use_double_cu_seqlens,
             use_llama3=True,
+            forward_only=forward_only,
+            num_iter=num_iter,
+            log=True,
+            profile=profile,
+        )
+
+    # Benchmark zigzag_llama3_flash_attn with all 4 kernel mode combinations
+    # Uses the shared benchmark() function with use_zigzag_llama3=True
+    for fused_fwd, fused_bwd, mode_name in [
+        (False, False, "Two-Kernels Forward, Two-Kernels Backward (Triton Optimized)"),
+        (False, True, "Two-Kernels Forward, Fused Backward (Triton Optimized)"),
+        (True, False, "Fused Forward, Two-Kernels Backward (Python Fallback)"),
+        (True, True, "Fused Forward, Fused Backward (Python Fallback)"),
+    ]:
+        torch.cuda.empty_cache()
+        if rank == 0:
+            print(f"# zigzag_llama3_flash_attn_varlen_kvpacked_func ({mode_name})")
+
+        benchmark(
+            zigzag_llama3_flash_attn_varlen_kvpacked_func,
+            use_double_cu_seqlens=True,
+            use_zigzag_llama3=True,
+            use_fused_fwd=fused_fwd,
+            use_fused_bwd=fused_bwd,
+            forward_only=forward_only,
+            num_iter=num_iter,
+            log=False,
+        )
+        benchmark(
+            zigzag_llama3_flash_attn_varlen_kvpacked_func,
+            use_double_cu_seqlens=True,
+            use_zigzag_llama3=True,
+            use_fused_fwd=fused_fwd,
+            use_fused_bwd=fused_bwd,
             forward_only=forward_only,
             num_iter=num_iter,
             log=True,

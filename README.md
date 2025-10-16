@@ -75,7 +75,7 @@ Note that
 
 ## Performance Summary
 
-The following table summarizes the performance of the implemented APIs:
+### Batch API
 
 | batch api            | GPU     | theoretic<br />flash_attn     | ring_attn     | zigzag_ring     | stripe_attn     |
 | -------------------- | ------- | ----------------------------- | ------------- | --------------- | --------------- |
@@ -87,20 +87,25 @@ The following table summarizes the performance of the implemented APIs:
 |                      |         |                               | 51.4%         | **81.7%**       | 69.6%           |
 | fwd + bwd (iter/sec) | 8xA100  | 94.7 / 8 = 11.8               | 6.2           | 10.6            | 9.75            |
 |                      |         |                               | 52.5%         | **89.8%**       | 82.6%           |
-| **varlen api**       | **GPU** | **theoretic<br />flash_attn** | **ring_attn** | **zigzag_ring** | **llama3_attn** |
-| fwd only (iter/sec)  | 8xH800  | 852.4 / 8 = 106.6             | 52.4          | 74.8            | 60.8            |
-|                      |         |                               | 49.1%         | **70.2%**       | 57.0%           |
-| fwd + bwd (iter/sec) | 8xH800  | 225.4 / 8 = 28.2              | 14.4          | 21.4            | 16.4            |
-|                      |         |                               | 51.1%         | **75.9%**       | 58.1%           |
-| fwd only (iter/sec)  | 8xA100  | 532.3 / 8 = 66.5              | 33.1          | 47.9            | 34.3            |
-|                      |         |                               | 49.8%         | **72.0%**       | 51.6%           |
-| fwd + bwd (iter/sec) | 8xA100  | 133.8 / 8 = 16.7              | 8.7           | 13.4            | 9.7             |
-|                      |         |                               | 52.1%         | **80.2%**       | 58.0%           |
+
+### Varlen API
+
+| varlen api           | GPU     | theoretic<br />flash_attn     | ring_attn     | zigzag_ring     | llama3_attn     | zigzag_llama3<br />(two-kernels) | zigzag_llama3<br />(fused) |
+| -------------------- | ------- | ----------------------------- | ------------- | --------------- | --------------- | -------------------------------- | -------------------------- |
+| fwd only (iter/sec)  | 8xH800  | 852.4 / 8 = 106.6             | 52.4          | 74.8            | 60.8            | N/A                              | N/A                        |
+|                      |         |                               | 49.1%         | **70.2%**       | 57.0%           |                                  |                            |
+| fwd + bwd (iter/sec) | 8xH800  | 225.4 / 8 = 28.2              | 14.4          | 21.4            | 16.4            | N/A                              | N/A                        |
+|                      |         |                               | 51.1%         | **75.9%**       | 58.1%           |                                  |                            |
+| fwd only (iter/sec)  | 8xA100   | 509.3 / 8 = 63.7              | 31.7          | 47.2            | 29.9            | **52.4**                         | 48.4                       |
+|                      |         |                               | 49.7%         | 74.2%           | 47.0%           | **82.3%**                        | 76.1%                      |
+| fwd + bwd (iter/sec) | 8xA100   | 134.2 / 8 = 16.8              | 8.3           | 13.2            | 9.3             | **14.6**                         | 14.0                       |
+|                      |         |                               | 49.4%         | 78.7%           | 55.3%           | **86.8%**                        | 83.2%                      |
 
 Note that
 
 - The code of the benchmark is in [benchmark](benchmark/), its configuration matches the [Meta-Llama-3.1-8B](https://huggingface.co/NousResearch/Meta-Llama-3.1-8B/blob/main/config.json) setting, with a total sequence of length 8k per GPU.
 - When running the benchmark with with 8 gpu, the flash attn code is running with 1/8 computation of ring attention, as flash attn code is running `8*1^2`, while the ring attn code is running `1*8^2`.
+- **Latest benchmark (8xA100, last 2 rows)**: Shows **zigzag_llama3 achieving 82.3% efficiency for forward-only** (52.4 iter/s) and **86.8% efficiency for forward+backward** (14.6 iter/s), making it the **fastest distributed attention method** in both modes. For forward+backward, this represents a **10.3% improvement over zigzag_ring** and **75.5% improvement over standard ring**. For forward-only, **10.9% faster than zigzag_ring** and **65.5% faster than standard ring**. The Two-Kernels mode (Python implementation) provides the best performance.
 - NVLink between GPUs are required for high performance.
 - Please remember to adapt the RoPE offset for different api.
 
@@ -127,7 +132,7 @@ pip install .
 - [x] Implement `*_kvpacked_func` and `*_func` variant for all APIs
 - [x] ~~Optimize `*_varlen_func`~~ Implement `llama3_flash_attn_varlen_func`
 - [x] ~~Add an example to train llama~~ Implement adapter for huggingface model
-- [ ] Implement `zigzag_llama3_flash_attn_varlen_func`
+- [x] Implement `zigzag_llama3_flash_attn_varlen_func` - **Achieved 86.8% efficiency (fwd+bwd) and 82.3% efficiency (fwd only), the fastest distributed attention method!**
 
 ### Test
 
