@@ -285,12 +285,13 @@ if __name__ == "__main__":
         )
 
     # Benchmark zigzag_llama3_flash_attn with all 4 kernel mode combinations
-    # Uses the shared benchmark() function with use_zigzag_llama3=True
+    # Two modes: use_fused_kernel=False (standard flash attn, no SMEM sharing)
+    #            use_fused_kernel=True (grouped attention, SMEM K,V sharing)
     for fused_fwd, fused_bwd, mode_name in [
-        (False, False, "Two-Kernels Forward, Two-Kernels Backward (Triton Optimized)"),
-        (False, True, "Two-Kernels Forward, Fused Backward (Triton Optimized)"),
-        (True, False, "Fused Forward, Two-Kernels Backward (Python Fallback)"),
-        (True, True, "Fused Forward, Fused Backward (Python Fallback)"),
+        (False, False, "Two-Kernels Forward, Two-Kernels Backward"),
+        (False, True, "Two-Kernels Forward, Fused Backward"),
+        (True, False, "Fused Forward (Grouped), Two-Kernels Backward"),
+        (True, True, "Fused Forward (Grouped), Fused Backward (Grouped)"),
     ]:
         torch.cuda.empty_cache()
         if rank == 0:

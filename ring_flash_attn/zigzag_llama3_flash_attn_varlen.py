@@ -424,7 +424,7 @@ def execute_two_kernels_mode(
     chunk_q_list: List[torch.Tensor],
     chunk_cu_seqlens_q_list: List[torch.Tensor],
     chunk_indices_list: List[torch.Tensor],
-    kv_buffer: torch.Tensor,  # Changed: now takes zigzag buffer directly
+    kv_buffer: torch.Tensor,
     kv_slices: List[Tuple[int, torch.Tensor]],
     nheads: int,
     head_dim: int,
@@ -436,7 +436,6 @@ def execute_two_kernels_mode(
     deterministic: bool,
     world_size: int,
     cu_seqlens_k: torch.Tensor,
-    use_triton_kernel: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Execute attention with two sequential kernel calls (one per group).
@@ -445,11 +444,10 @@ def execute_two_kernels_mode(
 
     OPTIMIZATION: Extract K,V only once for the maximum group, then slice for smaller groups.
     Since late group contains early group (e.g., [0-7] contains [0-3]), we avoid redundant extraction.
+    Uses Triton kernel for fast KV extraction.
 
     Args:
         kv_buffer: [2, total_tokens, nheads_k, head_dim] - zigzag interleaved buffer
-        use_triton_kernel: If True, use Triton kernel to extract slices directly.
-                           If False, fall back to Python rearrangement (for debugging).
 
     Returns:
         out: Combined output in original local Q order
@@ -470,17 +468,6 @@ def execute_two_kernels_mode(
         print(f"  kv_buffer NaN={has_nan_kv} Inf={has_inf_kv}")
         print(f"  cu_seqlens_k (LOCAL): {cu_seqlens_k.tolist()}")
         print(f"  world_size: {world_size}")
-        print(f"  use_triton_kernel: {use_triton_kernel}")
-
-    # Rearrange to contiguous format once for Python fallback
-    kv_contiguous = None
-    if not use_triton_kernel:
-        kv_contiguous = rearrange_kv_from_zigzag_to_contiguous(kv_buffer, world_size, cu_seqlens_k)
-        # DEBUG
-        if os.environ.get('DEBUG_ZIGZAG', '0') == '1':
-            has_nan_cont = torch.isnan(kv_contiguous).any().item()
-            has_inf_cont = torch.isinf(kv_contiguous).any().item()
-            print(f"  After rearrange: kv_contiguous.shape={kv_contiguous.shape}, NaN={has_nan_cont} Inf={has_inf_cont}")
 
     # Process each group, extracting K,V specifically for that group
     for group_idx, (q_group, cu_seqlens_q_group) in enumerate(zip(chunk_q_list, chunk_cu_seqlens_q_list)):
@@ -500,70 +487,57 @@ def execute_two_kernels_mode(
             print(f"  cu_seqlens_k_slice: {cu_seqlens_k_slice.tolist()}")
             print(f"  seq_ranges (GLOBAL): {seq_ranges}")
             print(f"  kv_buffer.shape: {kv_buffer.shape}")
-            print(f"  use_triton_kernel: {use_triton_kernel}")
 
-        # Extract K,V for this specific group
-        if use_triton_kernel:
-            # Use Triton kernel to extract K,V slices directly from zigzag buffer
-            # Build seq_ranges_with_chunk_idx: [(start, end, max_chunk_idx), ...]
-            # NOTE: seq_ranges contains GLOBAL coordinates
-            # The start/end are ONLY used to compute output buffer size (num_tokens = end - start)
-            # The actual extraction is controlled by max_chunk_idx
-            # So we keep GLOBAL coordinates for start/end to get correct output size!
-            seq_ranges_with_chunk_idx = []
-            for seq_idx, (start_global, end_global) in enumerate(seq_ranges):
-                # Get LOCAL sequence length to compute max_chunk_idx
-                seq_start_local = cu_seqlens_k[seq_idx].item()
-                seq_end_local = cu_seqlens_k[seq_idx + 1].item()
-                seq_len_local = seq_end_local - seq_start_local
-                total_chunks = 2 * world_size
+        # Extract K,V for this specific group using Triton kernel
+        # Use Triton kernel to extract K,V slices directly from zigzag buffer
+        # Build seq_ranges_with_chunk_idx: [(start, end, max_chunk_idx), ...]
+        # NOTE: seq_ranges contains GLOBAL coordinates
+        # The start/end are ONLY used to compute output buffer size (num_tokens = end - start)
+        # The actual extraction is controlled by max_chunk_idx
+        # So we keep GLOBAL coordinates for start/end to get correct output size!
+        seq_ranges_with_chunk_idx = []
+        for seq_idx, (start_global, end_global) in enumerate(seq_ranges):
+            # Get LOCAL sequence length to compute max_chunk_idx
+            seq_start_local = cu_seqlens_k[seq_idx].item()
+            seq_end_local = cu_seqlens_k[seq_idx + 1].item()
+            seq_len_local = seq_end_local - seq_start_local
+            total_chunks = 2 * world_size
 
-                # Compute max_chunk_idx from GLOBAL token count
-                num_tokens_global = end_global - start_global
-                chunk_size_global = seq_len_local * world_size // total_chunks
-                max_chunk_idx = (num_tokens_global // chunk_size_global) - 1
+            # Compute max_chunk_idx from GLOBAL token count
+            num_tokens_global = end_global - start_global
+            chunk_size_global = seq_len_local * world_size // total_chunks
+            max_chunk_idx = (num_tokens_global // chunk_size_global) - 1
 
-                # Keep GLOBAL coordinates for start/end so output buffer size is correct
-                # The Triton kernel only uses (end - start) to determine output size
-                # It uses max_chunk_idx to determine what to extract from zigzag buffer
-                seq_ranges_with_chunk_idx.append((start_global, end_global, max_chunk_idx))
-
-                # DEBUG
-                if os.environ.get('DEBUG_ZIGZAG', '0') == '1':
-                    print(f"  Seq {seq_idx}: GLOBAL range ({start_global}, {end_global}), max_chunk_idx={max_chunk_idx}, output_tokens={end_global - start_global}")
+            # Keep GLOBAL coordinates for start/end so output buffer size is correct
+            # The Triton kernel only uses (end - start) to determine output size
+            # It uses max_chunk_idx to determine what to extract from zigzag buffer
+            seq_ranges_with_chunk_idx.append((start_global, end_global, max_chunk_idx))
 
             # DEBUG
             if os.environ.get('DEBUG_ZIGZAG', '0') == '1':
-                print(f"  seq_ranges_with_chunk_idx (GLOBAL ranges + max_chunk_idx): {seq_ranges_with_chunk_idx}")
+                print(f"  Seq {seq_idx}: GLOBAL range ({start_global}, {end_global}), max_chunk_idx={max_chunk_idx}, output_tokens={end_global - start_global}")
 
-            # Create GLOBAL cu_seqlens for Triton kernel
-            # The Triton kernel needs GLOBAL cu_seqlens to compute sequence lengths correctly
-            cu_seqlens_k_global = torch.tensor(
-                [cu_seqlens_k[i].item() * world_size for i in range(len(cu_seqlens_k))],
-                device=cu_seqlens_k.device,
-                dtype=cu_seqlens_k.dtype
-            )
+        # DEBUG
+        if os.environ.get('DEBUG_ZIGZAG', '0') == '1':
+            print(f"  seq_ranges_with_chunk_idx (GLOBAL ranges + max_chunk_idx): {seq_ranges_with_chunk_idx}")
 
-            nheads_k = kv_buffer.shape[2]
-            k_slice, v_slice = extract_zigzag_kv_slices_for_group(
-                kv_buffer,
-                seq_ranges_with_chunk_idx,
-                cu_seqlens_k_global,  # Pass GLOBAL, not LOCAL!
-                world_size,
-                nheads_k,
-                head_dim,
-            )
-        else:
-            # Fallback: Python-based extraction
-            # Extract K,V slices for each sequence and concatenate
-            k_slices = []
-            v_slices = []
-            for start, end in seq_ranges:
-                k_slices.append(kv_contiguous[0, start:end])
-                v_slices.append(kv_contiguous[1, start:end])
+        # Create GLOBAL cu_seqlens for Triton kernel
+        # The Triton kernel needs GLOBAL cu_seqlens to compute sequence lengths correctly
+        cu_seqlens_k_global = torch.tensor(
+            [cu_seqlens_k[i].item() * world_size for i in range(len(cu_seqlens_k))],
+            device=cu_seqlens_k.device,
+            dtype=cu_seqlens_k.dtype
+        )
 
-            k_slice = torch.cat(k_slices, dim=0)  # [total_k_tokens, heads, dim]
-            v_slice = torch.cat(v_slices, dim=0)  # [total_v_tokens, heads, dim]
+        nheads_k = kv_buffer.shape[2]
+        k_slice, v_slice = extract_zigzag_kv_slices_for_group(
+            kv_buffer,
+            seq_ranges_with_chunk_idx,
+            cu_seqlens_k_global,  # Pass GLOBAL, not LOCAL!
+            world_size,
+            nheads_k,
+            head_dim,
+        )
 
         # DEBUG: Check for NaN/Inf after extraction
         if os.environ.get('DEBUG_ZIGZAG', '0') == '1':
@@ -860,7 +834,7 @@ def execute_two_kernels_mode_grouped(
     chunk_q_list: List[torch.Tensor],
     chunk_cu_seqlens_q_list: List[torch.Tensor],
     chunk_indices_list: List[torch.Tensor],
-    kv_buffer: torch.Tensor,  # Zigzag buffer [2, total_tokens, nheads_k, head_dim]
+    kv_buffer: torch.Tensor,
     kv_slices: List[Tuple[int, torch.Tensor]],
     nheads: int,
     head_dim: int,
@@ -872,7 +846,6 @@ def execute_two_kernels_mode_grouped(
     deterministic: bool,
     world_size: int,
     cu_seqlens_k: torch.Tensor,
-    use_triton_kernel: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Execute attention with grouped kernel call (multiple Q groups in one API call).
@@ -903,7 +876,6 @@ def execute_two_kernels_mode_grouped(
         print(f"  kv_buffer NaN={has_nan_kv} Inf={has_inf_kv}")
         print(f"  cu_seqlens_k (LOCAL): {cu_seqlens_k.tolist()}")
         print(f"  world_size: {world_size}")
-        print(f"  use_triton_kernel: {use_triton_kernel}")
 
     # Rearrange K,V to contiguous format (needed for grouped attention)
     kv_contiguous = rearrange_kv_from_zigzag_to_contiguous(kv_buffer, world_size, cu_seqlens_k)
@@ -1060,10 +1032,16 @@ def execute_fused_kernel_mode(
     deterministic: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
     """
-    Execute attention with NEW grouped flash attention API (_flash_attn_varlen_forward_grouped).
+    Execute attention with grouped flash attention API.
 
-    OPTIMIZATION: Uses grouped API with sequential kernel launches and unified K,V addressing
-    for 5-13% speedup through L2 cache reuse. No K,V duplication needed!
+    The grouped API requires K,V organized so Group 0's data is a PREFIX of Group 1's data.
+    We reorganize kv_contiguous from sequence-major to chunk-major order:
+    - Original: [seq0_all_chunks, seq1_all_chunks, ...]
+    - Reorganized: [all_seqs_chunk0, all_seqs_chunk1, ..., all_seqs_chunk7]
+
+    Then:
+    - Group 0 (early chunks) gets prefix: [all_seqs_chunk0]
+    - Group 1 (late chunks) gets full buffer: [all_seqs_chunk0, chunk1, ..., chunk7]
 
     Returns:
         out: Combined output in original local Q order
@@ -1072,43 +1050,181 @@ def execute_fused_kernel_mode(
     """
     from flash_attn.flash_attn_interface import _flash_attn_varlen_forward_grouped
 
-    # Prepare Q groups (no concatenation - keep separate!)
-    q_list = chunk_q_list
+    # The grouped API uses cu_seqlens_k endpoints to slice K,V:
+    # Group i attends to k[:cu_seqlens_k_list[i][-1]]
+    #
+    # For this to work, K,V must be organized so Group 0's data is a PREFIX of Group 1's data.
+    #
+    # Current kv_contiguous is sequence-major: [seq0_all_chunks, seq1_all_chunks, ...]
+    # We need CHUNK-MAJOR order: [all_seqs_chunk0, all_seqs_chunk1, ..., all_seqs_chunk7]
+    #
+    # Then cu_seqlens can be:
+    # - Group 0: [0, seq0_chunk0_len, seq0_chunk0_len+seq1_chunk0_len] (prefix)
+    # - Group 1: [0, seq0_all_chunks_len, seq0_all_chunks_len+seq1_all_chunks_len] (full)
 
-    # Prepare K,V: Extract once and share across all Q groups
-    # All groups will access the SAME K,V buffer via different cu_seqlens
-    k_slices = []
-    v_slices = []
-    for start, end in kv_slices[0][0]:  # Use first group's sequence ranges as template
-        k_slices.append(kv_contiguous[0, start:end])
-        v_slices.append(kv_contiguous[1, start:end])
+    num_sequences = len(kv_slices[0][0]) if kv_slices[0][0] else 0
 
-    k_shared = torch.cat(k_slices, dim=0)
-    v_shared = torch.cat(v_slices, dim=0)
+    if num_sequences == 0:
+        # No data
+        k_shared = torch.empty((0, kv_contiguous.shape[2], kv_contiguous.shape[3]),
+                               dtype=kv_contiguous.dtype, device=kv_contiguous.device)
+        v_shared = torch.empty_like(k_shared)
+        cu_seqlens_k_list = [kv_slices[i][1] for i in range(len(kv_slices))]
+        q_list = chunk_q_list
+    else:
+        # Reorganize K,V from sequence-major to chunk-major order
+        # kv_contiguous is currently: [chunk0, chunk1, ..., chunk7] per sequence
+        # where contiguous buffer offset for seq_i is at cu_seqlens_k_global[i]
 
-    # Prepare cu_seqlens_k for each group (different lengths accessing same K,V buffer)
-    cu_seqlens_k_list = []
-    max_seqlen_k_list = []
+        # Determine total chunks from last group's ranges
+        seq_ranges_group0, _ = kv_slices[0]
+        seq_ranges_group1, _ = kv_slices[-1]
 
-    for seq_ranges, cu_seqlens_k_slice in kv_slices:
-        # Each group gets its own cu_seqlens pointing into the shared K,V buffer
-        cu_seqlens_k_list.append(cu_seqlens_k_slice)
-        max_seqlen_k = (cu_seqlens_k_slice[1:] - cu_seqlens_k_slice[:-1]).max().item()
-        max_seqlen_k_list.append(max_seqlen_k)
+        # For each sequence, compute chunk size
+        # Assuming all sequences have same chunk structure
+        total_chunks = 2 * dist.get_world_size() if dist.is_initialized() else 8
 
-    # Prepare cu_seqlens_q and max_seqlen_q for each group
+        # Calculate how many chunks each group needs by comparing range lengths
+        # Group 0 has shorter ranges (fewer chunks), Group 1 has full ranges
+        if len(seq_ranges_group0) > 0 and len(seq_ranges_group1) > 0:
+            # Calculate chunks needed per group from the first sequence's range
+            range0_len = seq_ranges_group0[0][1] - seq_ranges_group0[0][0]
+            range1_len = seq_ranges_group1[0][1] - seq_ranges_group1[0][0]
+            chunk_size = range1_len // total_chunks
+            chunks_group0 = range0_len // chunk_size if chunk_size > 0 else 1
+            chunks_group1 = total_chunks
+
+            # CRITICAL: For grouped API with variable-length sequences, we need to
+            # duplicate data to make both groups work with cu_seqlens.
+            #
+            # Organization: k_shared = [Group0_data, Group1_data]
+            # - Group 0 data: [seq0_early, seq1_early, seq2_early]  (prefix)
+            # - Group 1 data: [seq0_all, seq1_all, seq2_all]  (full)
+            #
+            # This allows:
+            # - Group 0: cu_seqlens = [0, early0, early0+early1, ...], endpoint = sum(early)
+            # - Group 1: cu_seqlens = [offset, offset+all0, offset+all0+all1, ...], endpoint = offset+sum(all)
+            #
+            # Trade-off: Duplicates early chunks (~50% memory overhead) but enables correct computation
+            # and L2 cache sharing (Group 0 loads early data, Group 1 reuses it from cache).
+
+            # Build Group 0 data: early chunks only
+            k_group0_chunks = []
+            v_group0_chunks = []
+
+            for seq_idx in range(num_sequences):
+                start_g0, end_g0 = seq_ranges_group0[seq_idx]
+                k_group0_chunks.append(kv_contiguous[0, start_g0:end_g0])
+                v_group0_chunks.append(kv_contiguous[1, start_g0:end_g0])
+
+            k_group0 = torch.cat(k_group0_chunks, dim=0)
+            v_group0 = torch.cat(v_group0_chunks, dim=0)
+
+            # Build Group 1 data: all chunks (early + late) per sequence
+            k_group1_seqs = []
+            v_group1_seqs = []
+
+            for seq_idx in range(num_sequences):
+                start_g0, end_g0 = seq_ranges_group0[seq_idx]
+                start_g1, end_g1 = seq_ranges_group1[seq_idx]
+
+                # Concatenate early + late for this sequence
+                k_seq = torch.cat([
+                    kv_contiguous[0, start_g0:end_g0],  # early
+                    kv_contiguous[0, end_g0:end_g1],     # late
+                ], dim=0)
+                v_seq = torch.cat([
+                    kv_contiguous[1, start_g0:end_g0],
+                    kv_contiguous[1, end_g0:end_g1],
+                ], dim=0)
+
+                k_group1_seqs.append(k_seq)
+                v_group1_seqs.append(v_seq)
+
+            k_group1 = torch.cat(k_group1_seqs, dim=0)
+            v_group1 = torch.cat(v_group1_seqs, dim=0)
+
+            # Concatenate: [Group0_data, Group1_data]
+            k_shared = torch.cat([k_group0, k_group1], dim=0)
+            v_shared = torch.cat([v_group0, v_group1], dim=0)
+
+            # Build cu_seqlens for Group 0
+            cu_seqlens_k_group0 = [0]
+            for seq_idx in range(num_sequences):
+                start_g0, end_g0 = seq_ranges_group0[seq_idx]
+                early_len = end_g0 - start_g0
+                cu_seqlens_k_group0.append(cu_seqlens_k_group0[-1] + early_len)
+
+            # Build cu_seqlens for Group 1 (offset by Group0 size)
+            group0_size = cu_seqlens_k_group0[-1]
+            cu_seqlens_k_group1 = [group0_size]
+            for seq_idx in range(num_sequences):
+                start_g1, end_g1 = seq_ranges_group1[seq_idx]
+                total_len = end_g1 - start_g1
+                cu_seqlens_k_group1.append(cu_seqlens_k_group1[-1] + total_len)
+
+            # Convert to tensors
+            cu_seqlens_k_list = [
+                torch.tensor(cu_seqlens_k_group0, dtype=torch.int32, device=k_shared.device),
+                torch.tensor(cu_seqlens_k_group1, dtype=torch.int32, device=k_shared.device),
+            ]
+
+            # Debug output
+            import os
+            if os.environ.get('DEBUG_GROUPED_API', '0') == '1':
+                print(f"\n[DEBUG] Grouped API K,V organization (FIXED v2 - with duplication):")
+                print(f"  num_sequences: {num_sequences}")
+                print(f"  k_shared.shape: {k_shared.shape}")
+                print(f"  v_shared.shape: {v_shared.shape}")
+                print(f"  Organization: [Group0_early_only, Group1_all_chunks]")
+                print(f"  Group 0 size: {group0_size}")
+                print(f"  cu_seqlens_k_group0: {cu_seqlens_k_list[0].tolist()}")
+                print(f"  cu_seqlens_k_group1: {cu_seqlens_k_list[1].tolist()}")
+                print(f"  Group 0 endpoint: {cu_seqlens_k_list[0][-1].item()}")
+                print(f"  Group 1 endpoint: {cu_seqlens_k_list[1][-1].item()}")
+                print(f"  seq_ranges_group0 (in kv_contiguous): {seq_ranges_group0}")
+                print(f"  seq_ranges_group1 (in kv_contiguous): {seq_ranges_group1}")
+                for seq_idx in range(num_sequences):
+                    start_g0, end_g0 = seq_ranges_group0[seq_idx]
+                    start_g1, end_g1 = seq_ranges_group1[seq_idx]
+                    early_len = end_g0 - start_g0
+                    late_len = end_g1 - end_g0
+                    total_len = end_g1 - start_g1
+                    print(f"  Seq {seq_idx}: early_len={early_len}, late_len={late_len}, total_len={total_len}")
+                print(f"  Note: Early chunks duplicated (~50% memory overhead for correctness)")
+
+            q_list = chunk_q_list
+        else:
+            # Fallback: use original slicing approach
+            seq_ranges_full, _ = kv_slices[-1]
+            k_slices = []
+            v_slices = []
+            for start, end in seq_ranges_full:
+                k_slices.append(kv_contiguous[0, start:end])
+                v_slices.append(kv_contiguous[1, start:end])
+            k_shared = torch.cat(k_slices, dim=0)
+            v_shared = torch.cat(v_slices, dim=0)
+            cu_seqlens_k_list = [kv_slices[i][1] for i in range(len(kv_slices))]
+            q_list = chunk_q_list
+
     max_seqlen_q_list = [
-        (chunk_cu[1:] - chunk_cu[:-1]).max().item()
+        (chunk_cu[1:] - chunk_cu[:-1]).max().item() if len(chunk_cu) > 1 else 0
         for chunk_cu in chunk_cu_seqlens_q_list
     ]
 
+    max_seqlen_k_list = [
+        (cu_k[1:] - cu_k[:-1]).max().item() if len(cu_k) > 1 else 0
+        for cu_k in cu_seqlens_k_list
+    ]
+
     # Call grouped flash attention API
-    # Sequential execution is enabled in the CUDA kernel (flash_fwd_grouped_hdim128_*.cu)
-    # This will launch kernels SEQUENTIALLY with unified K,V addressing for L2 cache reuse
+    # The API will slice K,V based on cu_seqlens_k_list:
+    # - Group 0: k[:cu_seqlens_k_list[0][-1]]
+    # - Group 1: k[:cu_seqlens_k_list[1][-1]]
     out_list, lse_list, _, _ = _flash_attn_varlen_forward_grouped(
         q_list=q_list,
-        k=k_shared,  # ← Shared K,V across all groups (no duplication!)
-        v=v_shared,  # ← Shared K,V across all groups (no duplication!)
+        k=k_shared,  # Shared K,V buffer (Group 0's data is prefix of this)
+        v=v_shared,
         cu_seqlens_q_list=chunk_cu_seqlens_q_list,
         cu_seqlens_k_list=cu_seqlens_k_list,
         max_seqlen_q_list=max_seqlen_q_list,
@@ -1185,9 +1301,6 @@ def zigzag_llama3_flash_attn_varlen_forward(
     deterministic: bool = False,
     use_fused_kernel: bool = False,
     n_chunks: int = 2,
-    use_triton_kernel: bool = True,
-    use_triton_grouped: bool = False,
-    use_grouped_attention: bool = False,
 ):
     """
     Forward pass with zigzag-style Q chunking and llama3-style all-gather.
@@ -1195,10 +1308,10 @@ def zigzag_llama3_flash_attn_varlen_forward(
     Process:
     1. Receive Q, K, V in zigzag interleaved format
     2. All-gather K,V from all ranks (llama3-style)
-    3. [OPTIMIZED] Use Triton kernel to extract K,V slices directly from zigzag buffer
+    3. Use Triton kernel to extract K,V slices directly from zigzag buffer
     4. Split local Q by global chunk index (early vs late groups)
     5. Compute K,V slices for each group (causal attention)
-    6. Execute attention (two-kernels, fused, or triton-grouped mode)
+    6. Execute attention (two-kernels or fused mode)
     7. Return output in interleaved format
 
     Args:
@@ -1209,16 +1322,6 @@ def zigzag_llama3_flash_attn_varlen_forward(
         use_fused_kernel: If False, use two sequential kernels.
                           If True, use one kernel with duplicated K,V.
         n_chunks: Number of Q groups (default: 2 = early/late)
-        use_triton_kernel: If True, use Triton kernel for KV slicing (faster).
-                           If False, use Python rearrangement (for debugging).
-        use_triton_grouped: If True, use Triton grouped attention kernel (Option C).
-                            This eliminates redundant K,V loads by sharing them across groups.
-                            Expected 10-15% speedup over two-kernels mode.
-        use_grouped_attention: If True, use Python prototype grouped attention (Option B).
-                               This calls _flash_attn_varlen_forward_grouped which launches
-                               multiple flash attention kernels sequentially, relying on L2 cache
-                               for K,V sharing. Expected 5-10% speedup over two-kernels mode.
-                               Note: Cannot be used with use_triton_grouped or use_fused_kernel.
 
     Returns:
         out: Output tensor in zigzag interleaved format
@@ -1294,27 +1397,8 @@ def zigzag_llama3_flash_attn_varlen_forward(
         chunk_q_list_i = [q_chunk[:, q_slice] for q_chunk in chunk_q_list]
 
         # Execute attention for this head slice
-        if use_triton_grouped:
-            # Triton grouped mode: custom Triton kernel with shared K,V loads (Option C)
-            out_i, lse_i, chunk_info = execute_triton_grouped_mode(
-                chunk_q_list_i, chunk_cu_seqlens_q_list, chunk_indices_list,
-                kv_buffer, kv_slices,
-                nheads // nheads_k * heads_k_stride, head_dim, softmax_scale, dropout_p, causal,
-                window_size, alibi_slopes, deterministic,
-                world_size, cu_seqlens_k
-            )
-        elif use_grouped_attention:
-            # Grouped attention mode (Python prototype): uses _flash_attn_varlen_forward_grouped (Option B)
-            # Relies on L2 cache for K,V sharing between consecutive kernel launches
-            out_i, lse_i, chunk_info = execute_two_kernels_mode_grouped(
-                chunk_q_list_i, chunk_cu_seqlens_q_list, chunk_indices_list,
-                kv_buffer, kv_slices,
-                nheads // nheads_k * heads_k_stride, head_dim, softmax_scale, dropout_p, causal,
-                window_size, alibi_slopes, deterministic,
-                world_size, cu_seqlens_k, use_triton_kernel
-            )
-        elif use_fused_kernel:
-            # Fused kernel mode: needs contiguous rearrangement
+        if use_fused_kernel:
+            # Fused/grouped kernel: Use _flash_attn_varlen_forward_grouped with SMEM K,V sharing
             kv_contiguous = rearrange_kv_from_zigzag_to_contiguous(kv_buffer, world_size, cu_seqlens_k)
             out_i, lse_i, chunk_info = execute_fused_kernel_mode(
                 chunk_q_list_i, chunk_cu_seqlens_q_list, chunk_indices_list,
@@ -1323,13 +1407,14 @@ def zigzag_llama3_flash_attn_varlen_forward(
                 window_size, alibi_slopes, deterministic
             )
         else:
-            # Two-kernels mode: use Triton kernel for direct slicing
+            # Two separate kernels: Call _flash_attn_varlen_forward twice (no SMEM sharing)
+            # Uses Triton optimization for KV slicing internally
             out_i, lse_i, chunk_info = execute_two_kernels_mode(
                 chunk_q_list_i, chunk_cu_seqlens_q_list, chunk_indices_list,
                 kv_buffer, kv_slices,
                 nheads // nheads_k * heads_k_stride, head_dim, softmax_scale, dropout_p, causal,
                 window_size, alibi_slopes, deterministic,
-                world_size, cu_seqlens_k, use_triton_kernel
+                world_size, cu_seqlens_k
             )
 
         # Accumulate outputs
@@ -1352,8 +1437,7 @@ def rearrange_grad_from_contiguous_to_zigzag(
     grad_contiguous: torch.Tensor,
     world_size: int,
     cu_seqlens: torch.Tensor,
-    rank: int = None,
-    use_triton_kernel: bool = True,
+    rank: int,
 ) -> torch.Tensor:
     """
     Rearrange gradients from contiguous to zigzag interleaved format.
@@ -1366,7 +1450,6 @@ def rearrange_grad_from_contiguous_to_zigzag(
         cu_seqlens: [num_seqs + 1] - Cumulative sequence lengths for LOCAL sequences
                     (already divided by world_size at entry point)
         rank: Current rank (required for Triton kernel)
-        use_triton_kernel: If True, use Triton kernel (faster). If False, use Python.
 
     Returns:
         Gradients in zigzag interleaved format [2, total_tokens, heads, dim]
@@ -1376,75 +1459,32 @@ def rearrange_grad_from_contiguous_to_zigzag(
         Output (interleaved): [r0_c0, r0_c7, r1_c1, r1_c6, r2_c2, r2_c5, r3_c3, r3_c4]
                             = [c0, c7, c1, c6, c2, c5, c3, c4]
     """
-    if use_triton_kernel and rank is not None:
-        # OPTIMIZATION: Use Triton kernel for faster gradient rearrangement
-        # Process K and V separately
-        dk_contiguous = grad_contiguous[0]  # [total_tokens, heads, dim]
-        dv_contiguous = grad_contiguous[1]  # [total_tokens, heads, dim]
+    # Use Triton kernel for faster gradient rearrangement
+    # Process K and V separately
+    dk_contiguous = grad_contiguous[0]  # [total_tokens, heads, dim]
+    dv_contiguous = grad_contiguous[1]  # [total_tokens, heads, dim]
 
-        # Create GLOBAL cu_seqlens for Triton kernel
-        # The Triton kernel needs GLOBAL cu_seqlens (multiply LOCAL by world_size)
-        cu_seqlens_global = torch.tensor(
-            [cu_seqlens[i].item() * world_size for i in range(len(cu_seqlens))],
-            device=cu_seqlens.device,
-            dtype=cu_seqlens.dtype
-        )
+    # Create GLOBAL cu_seqlens for Triton kernel
+    # The Triton kernel needs GLOBAL cu_seqlens (multiply LOCAL by world_size)
+    cu_seqlens_global = torch.tensor(
+        [cu_seqlens[i].item() * world_size for i in range(len(cu_seqlens))],
+        device=cu_seqlens.device,
+        dtype=cu_seqlens.dtype
+    )
 
-        # Scatter both K and V gradients for ALL ranks (needed for reduce_scatter)
-        dk_zigzag_all_ranks = []
-        dv_zigzag_all_ranks = []
-        for r in range(world_size):
-            dk_zigzag_all_ranks.append(scatter_grad_to_zigzag(dk_contiguous, cu_seqlens_global, r, world_size))
-            dv_zigzag_all_ranks.append(scatter_grad_to_zigzag(dv_contiguous, cu_seqlens_global, r, world_size))
+    # Scatter both K and V gradients for ALL ranks (needed for reduce_scatter)
+    dk_zigzag_all_ranks = []
+    dv_zigzag_all_ranks = []
+    for r in range(world_size):
+        dk_zigzag_all_ranks.append(scatter_grad_to_zigzag(dk_contiguous, cu_seqlens_global, r, world_size))
+        dv_zigzag_all_ranks.append(scatter_grad_to_zigzag(dv_contiguous, cu_seqlens_global, r, world_size))
 
-        # Concatenate all ranks' data
-        dk_zigzag = torch.cat(dk_zigzag_all_ranks, dim=0)
-        dv_zigzag = torch.cat(dv_zigzag_all_ranks, dim=0)
+    # Concatenate all ranks' data
+    dk_zigzag = torch.cat(dk_zigzag_all_ranks, dim=0)
+    dv_zigzag = torch.cat(dv_zigzag_all_ranks, dim=0)
 
-        # Stack back to [2, total_tokens_all_ranks, heads, dim]
-        return torch.stack([dk_zigzag, dv_zigzag])
-    else:
-        # FALLBACK: Python implementation
-        num_sequences = len(cu_seqlens) - 1
-        total_chunks = 2 * world_size
-
-        # Process each sequence separately (they may have different lengths)
-        grad_interleaved_chunks = [[] for _ in range(world_size)]
-        global_pos = 0
-
-        for seq_idx in range(num_sequences):
-            seq_start = cu_seqlens[seq_idx].item()
-            seq_end = cu_seqlens[seq_idx + 1].item()
-            seq_len_local = seq_end - seq_start  # LOCAL sequence length
-            # grad_contiguous has GLOBAL size, so we need GLOBAL chunk size
-            # GLOBAL seq_len = seq_len_local * world_size
-            # chunk_size_global = (seq_len_local * world_size) // total_chunks
-            chunk_size = seq_len_local * world_size // total_chunks
-
-            # For each chunk in this sequence, determine which rank it belongs to
-            for chunk_idx in range(total_chunks):
-                # Determine which rank has this chunk
-                if chunk_idx < world_size:
-                    # Early chunks: rank = chunk_idx
-                    rank_owner = chunk_idx
-                else:
-                    # Late chunks: rank = 2*world_size - 1 - chunk_idx
-                    rank_owner = 2 * world_size - 1 - chunk_idx
-
-                # Extract chunk from contiguous gradient
-                chunk_start = global_pos
-                chunk_end = global_pos + chunk_size
-                chunk = grad_contiguous[:, chunk_start:chunk_end]
-                grad_interleaved_chunks[rank_owner].append(chunk)
-
-                global_pos += chunk_size
-
-        # Concatenate chunks for each rank
-        grad_interleaved_list = []
-        for rank_chunks in grad_interleaved_chunks:
-            grad_interleaved_list.append(torch.cat(rank_chunks, dim=1))
-
-        return torch.cat(grad_interleaved_list, dim=1)
+    # Stack back to [2, total_tokens_all_ranks, heads, dim]
+    return torch.stack([dk_zigzag, dv_zigzag])
 
 
 # ============================================================================
@@ -1452,13 +1492,13 @@ def rearrange_grad_from_contiguous_to_zigzag(
 # ============================================================================
 
 def backward_two_kernels_mode(
-    dout: torch.Tensor,     # Already sliced for current head range
-    q: torch.Tensor,        # Already sliced for current head range
-    out: torch.Tensor,      # Already sliced for current head range
-    lse: torch.Tensor,      # Already sliced for current head range
-    kv_buffer: torch.Tensor,  # [2, total_tokens, heads_k_stride, head_dim] - zigzag buffer
-    dkv_buffer: torch.Tensor, # [2, total_tokens, heads_k_stride, head_dim] - output gradient buffer (GLOBAL contiguous space)
-    dq: torch.Tensor,       # Output buffer (already sliced for current head range)
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    dkv_buffer: torch.Tensor,
+    dq: torch.Tensor,
     chunk_indices_list: List[torch.Tensor],
     chunk_cu_seqlens_q_list: List[torch.Tensor],
     kv_slices: List[Tuple[int, torch.Tensor]],
@@ -1471,14 +1511,14 @@ def backward_two_kernels_mode(
     world_size: int,
     rank: int,
     cu_seqlens_k: torch.Tensor,
-    use_triton_kernel: bool = True,
-) -> None:  # No return - writes directly to dq and dkv_buffer
+) -> None:
     """
     Execute backward with two sequential kernel calls (one per group).
 
     Key: ACCUMULATE gradients for overlapping K,V regions.
 
     OPTIMIZATION: Extract K,V only once for the maximum group, then slice for smaller groups.
+    Uses Triton kernel for KV slicing.
 
     Args:
         dout: Already sliced for current head range
@@ -1488,7 +1528,6 @@ def backward_two_kernels_mode(
         kv_buffer: [2, total_tokens, heads_k_stride, head_dim] - zigzag buffer
         dkv_buffer: [2, total_tokens, heads_k_stride, head_dim] - output buffer (contiguous space)
         dq: Output buffer (already sliced for current head range)
-        use_triton_kernel: If True, use Triton kernel for KV slicing (faster).
 
     Returns:
         None - writes directly to dq and dkv_buffer
@@ -1520,11 +1559,6 @@ def backward_two_kernels_mode(
     nheads_k = kv_buffer.shape[2]
     head_dim = kv_buffer.shape[3]
 
-    # Rearrange to contiguous format once for Python fallback
-    kv_contiguous = None
-    if not use_triton_kernel:
-        kv_contiguous = rearrange_kv_from_zigzag_to_contiguous(kv_buffer, world_size, cu_seqlens_k)
-
     # Process each group, extracting K,V specifically for that group
     for group_idx, (dout_group, q_group, out_group, lse_group, cu_seqlens_q_group) in enumerate(zip(
         dout_groups, q_groups, out_groups, lse_groups, chunk_cu_seqlens_q_list
@@ -1543,55 +1577,44 @@ def backward_two_kernels_mode(
             print(f"[Rank {rank}] Backward Group {group_idx} - Before extraction:")
             print(f"  kv_buffer NaN={has_nan_kv}, shape={kv_buffer.shape}")
 
-        # Extract K,V for this specific group
-        if use_triton_kernel:
-            # Use Triton kernel to extract K,V slices directly from zigzag buffer
-            # NOTE: seq_ranges contains GLOBAL coordinates
-            # The start/end are ONLY used to compute output buffer size (num_tokens = end - start)
-            # The actual extraction is controlled by max_chunk_idx
-            # So we keep GLOBAL coordinates for start/end to get correct output size!
-            seq_ranges_with_chunk_idx = []
-            for seq_idx, (start_global, end_global) in enumerate(seq_ranges):
-                # Get LOCAL sequence length to compute max_chunk_idx
-                seq_start_local = cu_seqlens_k[seq_idx].item()
-                seq_end_local = cu_seqlens_k[seq_idx + 1].item()
-                seq_len_local = seq_end_local - seq_start_local
-                total_chunks = 2 * world_size
+        # Extract K,V for this specific group using Triton kernel
+        # Use Triton kernel to extract K,V slices directly from zigzag buffer
+        # NOTE: seq_ranges contains GLOBAL coordinates
+        # The start/end are ONLY used to compute output buffer size (num_tokens = end - start)
+        # The actual extraction is controlled by max_chunk_idx
+        # So we keep GLOBAL coordinates for start/end to get correct output size!
+        seq_ranges_with_chunk_idx = []
+        for seq_idx, (start_global, end_global) in enumerate(seq_ranges):
+            # Get LOCAL sequence length to compute max_chunk_idx
+            seq_start_local = cu_seqlens_k[seq_idx].item()
+            seq_end_local = cu_seqlens_k[seq_idx + 1].item()
+            seq_len_local = seq_end_local - seq_start_local
+            total_chunks = 2 * world_size
 
-                # Compute max_chunk_idx from GLOBAL token count
-                num_tokens_global = end_global - start_global
-                chunk_size_global = seq_len_local * world_size // total_chunks
-                max_chunk_idx = (num_tokens_global // chunk_size_global) - 1
+            # Compute max_chunk_idx from GLOBAL token count
+            num_tokens_global = end_global - start_global
+            chunk_size_global = seq_len_local * world_size // total_chunks
+            max_chunk_idx = (num_tokens_global // chunk_size_global) - 1
 
-                # Keep GLOBAL coordinates for start/end so output buffer size is correct
-                seq_ranges_with_chunk_idx.append((start_global, end_global, max_chunk_idx))
+            # Keep GLOBAL coordinates for start/end so output buffer size is correct
+            seq_ranges_with_chunk_idx.append((start_global, end_global, max_chunk_idx))
 
-            # Create GLOBAL cu_seqlens for Triton kernel
-            # The Triton kernel needs GLOBAL cu_seqlens to compute sequence lengths correctly
-            cu_seqlens_k_global = torch.tensor(
-                [cu_seqlens_k[i].item() * world_size for i in range(len(cu_seqlens_k))],
-                device=cu_seqlens_k.device,
-                dtype=cu_seqlens_k.dtype
-            )
+        # Create GLOBAL cu_seqlens for Triton kernel
+        # The Triton kernel needs GLOBAL cu_seqlens to compute sequence lengths correctly
+        cu_seqlens_k_global = torch.tensor(
+            [cu_seqlens_k[i].item() * world_size for i in range(len(cu_seqlens_k))],
+            device=cu_seqlens_k.device,
+            dtype=cu_seqlens_k.dtype
+        )
 
-            k_slice, v_slice = extract_zigzag_kv_slices_for_group(
-                kv_buffer,
-                seq_ranges_with_chunk_idx,
-                cu_seqlens_k_global,  # Pass GLOBAL, not LOCAL!
-                world_size,
-                nheads_k,
-                head_dim,
-            )
-        else:
-            # Fallback: Python-based extraction
-            k_slices = []
-            v_slices = []
-            for start, end in seq_ranges:
-                k_slices.append(kv_contiguous[0, start:end])
-                v_slices.append(kv_contiguous[1, start:end])
-
-            k_slice = torch.cat(k_slices, dim=0).contiguous()
-            v_slice = torch.cat(v_slices, dim=0).contiguous()
+        k_slice, v_slice = extract_zigzag_kv_slices_for_group(
+            kv_buffer,
+            seq_ranges_with_chunk_idx,
+            cu_seqlens_k_global,  # Pass GLOBAL, not LOCAL!
+            world_size,
+            nheads_k,
+            head_dim,
+        )
 
         # DEBUG: Check extracted K/V slices before backward
         import os
@@ -1887,7 +1910,6 @@ def zigzag_llama3_flash_attn_varlen_backward(
     chunk_indices_list: List[torch.Tensor] = None,
     chunk_cu_seqlens_q_list: List[torch.Tensor] = None,
     kv_slices: List[Tuple[int, torch.Tensor]] = None,
-    use_triton_kernel: bool = True,
 ):
     """
     Backward pass with zigzag-style Q chunking and llama3-style all-gather.
@@ -1895,7 +1917,7 @@ def zigzag_llama3_flash_attn_varlen_backward(
     Process:
     1. Receive dout in zigzag interleaved format
     2. All-gather K, V (needed for gradient computation)
-    3. [OPTIMIZED] Use Triton kernel to extract K,V slices directly from zigzag buffer
+    3. Use Triton kernel to extract K,V slices directly from zigzag buffer
     4. Split dout by chunk index
     5. Execute backward (two-kernels or fused mode)
     6. ACCUMULATE dK, dV gradients for overlapping regions
@@ -1911,7 +1933,6 @@ def zigzag_llama3_flash_attn_varlen_backward(
         kv_slices: From forward pass
         use_fused_kernel: If False, use two sequential kernels.
                           If True, use one fused kernel.
-        use_triton_kernel: If True, use Triton kernel for KV slicing (faster).
 
     Returns:
         dq: Gradients for Q in zigzag interleaved format
@@ -2012,15 +2033,13 @@ def zigzag_llama3_flash_attn_varlen_backward(
             )
         else:
             # Two-kernels mode
-            # Note: Currently using Python fallback for KV extraction in backward
-            # as Triton extraction kernel has autograd compatibility issues
-            # Triton scatter_grad kernel still used for gradient rearrangement
+            # Uses Triton kernel for KV extraction and gradient rearrangement
             backward_two_kernels_mode(
                 dout_i, q_i, out_i, lse_i,
                 kv_buffer, dkv_buffer, dq_i,
                 chunk_indices_list, chunk_cu_seqlens_q_list, kv_slices,
                 softmax_scale, dropout_p, causal, window_size, alibi_slopes, deterministic,
-                world_size, rank, cu_seqlens_k, use_triton_kernel=False
+                world_size, rank, cu_seqlens_k
             )
 
         # Convert gradients from contiguous to zigzag interleaved format
@@ -2045,7 +2064,7 @@ def zigzag_llama3_flash_attn_varlen_backward(
         )
 
         dkv_interleaved = rearrange_grad_from_contiguous_to_zigzag(
-            dkv_contiguous, world_size, cu_seqlens_k_local, rank, use_triton_kernel=use_triton_kernel
+            dkv_contiguous, world_size, cu_seqlens_k_local, rank
         )
 
         # DEBUG: After rearrange
@@ -2119,8 +2138,6 @@ class ZigzagLlama3FlashAttnVarlenFunc(torch.autograd.Function):
         use_fused_kernel_forward,
         use_fused_kernel_backward,
         n_chunks,
-        use_triton_grouped,
-        use_grouped_attention,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -2129,8 +2146,6 @@ class ZigzagLlama3FlashAttnVarlenFunc(torch.autograd.Function):
         v = v.contiguous()
 
         # Execute forward
-        # Use Triton kernel for two-kernels mode (not fused mode)
-        use_triton = not use_fused_kernel_forward
         out, lse, chunk_info = zigzag_llama3_flash_attn_varlen_forward(
             group, q, k, v,
             cu_seqlens_q, cu_seqlens_k,
@@ -2140,9 +2155,6 @@ class ZigzagLlama3FlashAttnVarlenFunc(torch.autograd.Function):
             window_size, alibi_slopes, deterministic,
             use_fused_kernel=use_fused_kernel_forward,
             n_chunks=n_chunks,
-            use_triton_kernel=use_triton,
-            use_triton_grouped=use_triton_grouped,
-            use_grouped_attention=use_grouped_attention,
         )
 
         # Save for backward
@@ -2170,9 +2182,6 @@ class ZigzagLlama3FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
 
-        # Use Triton kernel for two-kernels mode (not fused mode)
-        use_triton = not ctx.use_fused_kernel_backward
-
         dq, dk, dv = zigzag_llama3_flash_attn_varlen_backward(
             ctx.group,
             dout, q, k, v, out, lse,
@@ -2186,10 +2195,9 @@ class ZigzagLlama3FlashAttnVarlenFunc(torch.autograd.Function):
             chunk_indices_list=ctx.chunk_indices_list,
             chunk_cu_seqlens_q_list=ctx.chunk_cu_seqlens_q_list,
             kv_slices=ctx.kv_slices,
-            use_triton_kernel=use_triton,
         )
 
-        return (dq, dk, dv) + (None,) * 17
+        return (dq, dk, dv) + (None,) * 17  # 20 total params - 3 with gradients = 17 Nones
 
 
 # ============================================================================
@@ -2314,8 +2322,6 @@ def zigzag_llama3_flash_attn_varlen_kvpacked_func(
         use_fused_kernel_forward,
         use_fused_kernel_backward,
         n_chunks,
-        False,  # use_triton_grouped
-        False,  # use_grouped_attention
     )
 
 
@@ -2338,8 +2344,6 @@ def zigzag_llama3_flash_attn_varlen_func(
     use_fused_kernel_forward=False,
     use_fused_kernel_backward=False,
     n_chunks=2,
-    use_triton_grouped=False,
-    use_grouped_attention=False,
 ):
     """
     Zigzag Llama3 Flash Attention for variable-length sequences with separate Q, K, V.
@@ -2365,8 +2369,6 @@ def zigzag_llama3_flash_attn_varlen_func(
         use_fused_kernel_forward: Use fused kernel in forward pass
         use_fused_kernel_backward: Use fused kernel in backward pass
         n_chunks: Number of Q chunks (default: 2)
-        use_triton_grouped: Use Triton grouped attention kernel (Option C)
-        use_grouped_attention: Use Python prototype grouped attention (Option B)
 
     Returns:
         out: [total_tokens, nheads, head_dim] output in zigzag interleaved format
@@ -2382,7 +2384,5 @@ def zigzag_llama3_flash_attn_varlen_func(
         use_fused_kernel_forward,
         use_fused_kernel_backward,
         n_chunks,
-        use_triton_grouped,
-        use_grouped_attention,
     )
 
