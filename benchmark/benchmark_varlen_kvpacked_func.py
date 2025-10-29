@@ -17,8 +17,6 @@ def benchmark(
     use_double_cu_seqlens,
     use_llama3=False,
     use_zigzag_llama3=False,
-    use_fused_fwd=False,
-    use_fused_bwd=False,
     num_iter=100,
     forward_only=True,
     log=True,
@@ -144,8 +142,6 @@ def benchmark(
                 alibi_slopes=None,
                 deterministic=deterministic,
                 return_attn_probs=False,
-                use_fused_kernel_forward=use_fused_fwd,
-                use_fused_kernel_backward=use_fused_bwd,
                 n_chunks=2,
             )
         elif use_llama3:
@@ -284,38 +280,27 @@ if __name__ == "__main__":
             profile=profile,
         )
 
-    # Benchmark zigzag_llama3_flash_attn with all 4 kernel mode combinations
-    # Uses the shared benchmark() function with use_zigzag_llama3=True
-    for fused_fwd, fused_bwd, mode_name in [
-        (False, False, "Two-Kernels Forward, Two-Kernels Backward (Triton Optimized)"),
-        (False, True, "Two-Kernels Forward, Fused Backward (Triton Optimized)"),
-        (True, False, "Fused Forward, Two-Kernels Backward (Python Fallback)"),
-        (True, True, "Fused Forward, Fused Backward (Python Fallback)"),
-    ]:
-        torch.cuda.empty_cache()
-        if rank == 0:
-            print(f"# zigzag_llama3_flash_attn_varlen_kvpacked_func ({mode_name})")
+    # Benchmark zigzag_llama3_flash_attn
+    torch.cuda.empty_cache()
+    if rank == 0:
+        print(f"# zigzag_llama3_flash_attn_varlen_kvpacked_func")
 
-        benchmark(
-            zigzag_llama3_flash_attn_varlen_kvpacked_func,
-            use_double_cu_seqlens=True,
-            use_zigzag_llama3=True,
-            use_fused_fwd=fused_fwd,
-            use_fused_bwd=fused_bwd,
-            forward_only=forward_only,
-            num_iter=num_iter,
-            log=False,
-        )
-        benchmark(
-            zigzag_llama3_flash_attn_varlen_kvpacked_func,
-            use_double_cu_seqlens=True,
-            use_zigzag_llama3=True,
-            use_fused_fwd=fused_fwd,
-            use_fused_bwd=fused_bwd,
-            forward_only=forward_only,
-            num_iter=num_iter,
-            log=True,
-            profile=profile,
-        )
+    benchmark(
+        zigzag_llama3_flash_attn_varlen_kvpacked_func,
+        use_double_cu_seqlens=True,
+        use_zigzag_llama3=True,
+        forward_only=forward_only,
+        num_iter=num_iter,
+        log=False,
+    )
+    benchmark(
+        zigzag_llama3_flash_attn_varlen_kvpacked_func,
+        use_double_cu_seqlens=True,
+        use_zigzag_llama3=True,
+        forward_only=forward_only,
+        num_iter=num_iter,
+        log=True,
+        profile=profile,
+    )
 
     dist.destroy_process_group()
