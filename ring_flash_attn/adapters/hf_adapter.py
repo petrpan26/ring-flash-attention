@@ -46,6 +46,10 @@ def update_ring_flash_attn_params(
 ):
     world_size = dist.get_world_size(group=process_group)
     rank = dist.get_rank(group=process_group)
+
+    # Calculate ORIGINAL max_seqlen (needed for zigzag_llama3)
+    original_max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+
     (
         cu_seqlens_q,
         cu_seqlens_k,
@@ -74,8 +78,8 @@ def update_ring_flash_attn_params(
         {
             "cu_seqlens_q": local_cu_seqlens_q_tensor,
             "cu_seqlens_k": cu_seqlens if USE_ZIGZAG_LLAMA3 else cu_seqlens_k,  # Use global cu_seqlens for K in zigzag
-            "max_seqlen_q": max_seqlen_q,
-            "max_seqlen_k": max_seqlen_k,
+            "max_seqlen_q": original_max_seqlen if USE_ZIGZAG_LLAMA3 else max_seqlen_q,
+            "max_seqlen_k": original_max_seqlen if USE_ZIGZAG_LLAMA3 else max_seqlen_k,
             "local_k_slice": local_k_slice,
             "global_cu_seqlens": cu_seqlens,  # Store original for zigzag extraction
             "rank": rank,
