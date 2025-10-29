@@ -113,153 +113,131 @@ def main():
         print("# Testing Zigzag Llama3 Flash Attention (varlen)")
         print("#" * 60)
 
-    # Test all 4 execution modes
-    modes = [
-        (False, False, "Two-Kernels Forward, Two-Kernels Backward (Triton Kernel)"),
-        (False, True, "Two-Kernels Forward, Fused Backward (Triton Kernel)"),
-        (True, False, "Fused Forward, Two-Kernels Backward (Python Fallback)"),
-        (True, True, "Fused Forward, Fused Backward (Python Fallback)"),
-    ]
+    # Reference: Flash attention on full sequence
+    ref_out = flash_attn_varlen_kvpacked_func(
+        q,
+        kv,
+        cu_seqlens_tensor,
+        cu_seqlens_tensor,
+        max_seqlen,
+        max_seqlen,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=(-1, -1),
+        alibi_slopes=None,
+        deterministic=deterministic,
+    )
 
-    for use_fused_fwd, use_fused_bwd, mode_name in modes:
-        dist.barrier()
-        if rank == 0:
-            print("\n" + "=" * 60)
-            print(f"# Testing: {mode_name}")
-            print("=" * 60)
+    # Extract local reference output using zigzag pattern
+    local_ref_out = extract_local(ref_out, cu_seqlens_tensor, rank, world_size)
 
-        # Reference: Flash attention on full sequence
-        ref_out = flash_attn_varlen_kvpacked_func(
-            q,
-            kv,
-            cu_seqlens_tensor,
-            cu_seqlens_tensor,
-            max_seqlen,
-            max_seqlen,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=(-1, -1),
-            alibi_slopes=None,
-            deterministic=deterministic,
-        )
+    # Reset gradients
+    local_q.grad = None
+    local_kv.grad = None
 
-        # Extract local reference output using zigzag pattern
-        local_ref_out = extract_local(ref_out, cu_seqlens_tensor, rank, world_size)
+    # Forward pass
+    dist.barrier()
+    if rank == 0:
+        print("\n# Forward pass:")
 
-        # Reset gradients
-        local_q.grad = None
-        local_kv.grad = None
+    zigzag_out = zigzag_llama3_flash_attn_varlen_kvpacked_func(
+        local_q,
+        local_kv,
+        local_cu_seqlens_tensor,  # LOCAL cu_seqlens for Q
+        cu_seqlens_tensor,         # GLOBAL cu_seqlens (original, not from llama3_prepare)
+        max_seqlen,                # Use original max_seqlen
+        max_seqlen,                # Use original max_seqlen
+        heads_k_stride=nheads_k,  # Process all KV heads
+        local_k_slice=local_k_slice,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=(-1, -1),
+        alibi_slopes=None,
+        deterministic=deterministic,
+        n_chunks=2,
+    )
 
-        # Forward pass
-        dist.barrier()
-        if rank == 0:
-            print("\n# Forward pass:")
+    # Check forward output
+    out_diff = (local_ref_out - zigzag_out).abs()
+    log("zigzag_out", zigzag_out, rank0_only=True)
+    log("forward diff vs reference", out_diff)
 
-        zigzag_out = zigzag_llama3_flash_attn_varlen_kvpacked_func(
-            local_q,
-            local_kv,
-            local_cu_seqlens_tensor,  # LOCAL cu_seqlens for Q
-            cu_seqlens_tensor,         # GLOBAL cu_seqlens (original, not from llama3_prepare)
-            max_seqlen,                # Use original max_seqlen
-            max_seqlen,                # Use original max_seqlen
-            heads_k_stride=nheads_k,  # Process all KV heads
-            local_k_slice=local_k_slice,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=(-1, -1),
-            alibi_slopes=None,
-            deterministic=deterministic,
-            use_fused_kernel_forward=use_fused_fwd,
-            use_fused_kernel_backward=use_fused_bwd,
-            n_chunks=2,
-        )
+    # Assert reasonable error bounds
+    # With matching parameters, should get same tiny errors as llama3 test:
+    # - llama3 test: max ~0.0001, mean ~1e-09 (nearly exact)
+    # - zigzag_llama3 should match (both use same flash attention kernel)
+    max_diff = out_diff.max().item()
+    mean_diff = out_diff.mean().item()
+    if rank == 0:
+        if max_diff > 0.01 or mean_diff > 1e-06:
+            print(f"WARNING: Large forward difference detected!")
+            print(f"  Max diff: {max_diff:.6f}")
+            print(f"  Mean diff: {mean_diff:.9f}")
 
-        # Check forward output
-        out_diff = (local_ref_out - zigzag_out).abs()
-        log("zigzag_out", zigzag_out, rank0_only=True)
-        log("forward diff vs reference", out_diff)
+    # Numerical assertions (should match llama3 test accuracy)
+    assert max_diff < 0.01, f"Forward max diff {max_diff:.6f} exceeds tolerance 0.01"
+    assert mean_diff < 1e-05, f"Forward mean diff {mean_diff:.9f} exceeds tolerance 1e-05"
 
-        # Assert reasonable error bounds
-        # With matching parameters, should get same tiny errors as llama3 test:
-        # - llama3 test: max ~0.0001, mean ~1e-09 (nearly exact)
-        # - zigzag_llama3 should match (both use same flash attention kernel)
-        max_diff = out_diff.max().item()
-        mean_diff = out_diff.mean().item()
-        if rank == 0:
-            if max_diff > 0.01 or mean_diff > 1e-06:
-                print(f"WARNING: Large forward difference detected!")
-                print(f"  Max diff: {max_diff:.6f}")
-                print(f"  Mean diff: {mean_diff:.9f}")
+    # Backward pass
+    dist.barrier()
+    if rank == 0:
+        print("\n# Backward pass:")
 
-        # Numerical assertions (should match llama3 test accuracy)
-        assert max_diff < 0.01, f"Forward max diff {max_diff:.6f} exceeds tolerance 0.01"
-        assert mean_diff < 1e-05, f"Forward mean diff {mean_diff:.9f} exceeds tolerance 1e-05"
+    zigzag_out.backward(local_dout)
 
-        # Backward pass
-        dist.barrier()
-        if rank == 0:
-            print("\n# Backward pass:")
+    # Compare with reference gradients
+    q.grad = None
+    kv.grad = None
+    ref_out.backward(dout)
 
-        zigzag_out.backward(local_dout)
+    # Extract reference gradients using zigzag pattern
+    local_ref_dq = extract_local(q.grad, cu_seqlens_tensor, rank, world_size)
+    local_ref_dkv = extract_local(kv.grad, cu_seqlens_tensor, rank, world_size)
 
-        # Compare with reference gradients
-        q.grad = None
-        kv.grad = None
-        ref_out.backward(dout)
+    dq_diff = (local_ref_dq - local_q.grad).abs()
+    dk_diff = (local_ref_dkv[:, 0] - local_kv.grad[:, 0]).abs()
+    dv_diff = (local_ref_dkv[:, 1] - local_kv.grad[:, 1]).abs()
 
-        # Extract reference gradients using zigzag pattern
-        local_ref_dq = extract_local(q.grad, cu_seqlens_tensor, rank, world_size)
-        local_ref_dkv = extract_local(kv.grad, cu_seqlens_tensor, rank, world_size)
+    log("dq diff vs reference", dq_diff)
+    log("dk diff vs reference", dk_diff)
+    log("dv diff vs reference", dv_diff)
 
-        dq_diff = (local_ref_dq - local_q.grad).abs()
-        dk_diff = (local_ref_dkv[:, 0] - local_kv.grad[:, 0]).abs()
-        dv_diff = (local_ref_dkv[:, 1] - local_kv.grad[:, 1]).abs()
+    # Assert reasonable gradient error bounds
+    # Based on test_llama3_flash_attn_varlen_func.py baseline errors:
+    # - llama3 test: dQ max ~0.0001, dK max ~0.008, dV max ~0.016
+    # - zigzag_llama3 should match llama3 test accuracy
+    max_dq_diff = dq_diff.max().item()
+    max_dk_diff = dk_diff.max().item()
+    max_dv_diff = dv_diff.max().item()
+    mean_dq_diff = dq_diff.mean().item()
+    mean_dk_diff = dk_diff.mean().item()
+    mean_dv_diff = dv_diff.mean().item()
 
-        log("dq diff vs reference", dq_diff)
-        log("dk diff vs reference", dk_diff)
-        log("dv diff vs reference", dv_diff)
+    if rank == 0:
+        if max_dq_diff > 0.01 or max_dk_diff > 0.1 or max_dv_diff > 0.1:
+            print(f"WARNING: Large gradient difference detected!")
+            print(f"  Max dQ diff: {max_dq_diff:.6f}")
+            print(f"  Max dK diff: {max_dk_diff:.6f}")
+            print(f"  Max dV diff: {max_dv_diff:.6f}")
 
-        # Assert reasonable gradient error bounds
-        # Based on test_llama3_flash_attn_varlen_func.py baseline errors:
-        # - llama3 test: dQ max ~0.0001, dK max ~0.008, dV max ~0.016
-        # - zigzag_llama3 should match llama3 test accuracy
-        # - llama3 test: dQ max ~0.000122, dK/dV max ~0.0156
-        max_dq_diff = dq_diff.max().item()
-        max_dk_diff = dk_diff.max().item()
-        max_dv_diff = dv_diff.max().item()
-        mean_dq_diff = dq_diff.mean().item()
-        mean_dk_diff = dk_diff.mean().item()
-        mean_dv_diff = dv_diff.mean().item()
-
-        if rank == 0:
-            if max_dq_diff > 0.01 or max_dk_diff > 0.1 or max_dv_diff > 0.1:
-                print(f"WARNING: Large gradient difference detected!")
-                print(f"  Max dQ diff: {max_dq_diff:.6f}")
-                print(f"  Max dK diff: {max_dk_diff:.6f}")
-                print(f"  Max dV diff: {max_dv_diff:.6f}")
-
-        # Numerical assertions (should match llama3 test accuracy)
-        # llama3 test gets: dQ max ~0.000122, dK/dV max ~0.0156
-        # Allow small margin for zigzag pattern differences (increased for 8 GPUs)
-        assert max_dq_diff < 0.01, f"dQ max diff {max_dq_diff:.6f} exceeds tolerance 0.01"
-        assert max_dk_diff < 0.1, f"dK max diff {max_dk_diff:.6f} exceeds tolerance 0.1"
-        assert max_dv_diff < 0.1, f"dV max diff {max_dv_diff:.6f} exceeds tolerance 0.1"
-        assert mean_dq_diff < 1e-05, f"dQ mean diff {mean_dq_diff:.9f} exceeds tolerance 1e-05"
-        assert mean_dk_diff < 3e-04, f"dK mean diff {mean_dk_diff:.9f} exceeds tolerance 3e-04"
-        assert mean_dv_diff < 3e-04, f"dV mean diff {mean_dv_diff:.9f} exceeds tolerance 3e-04"
-
-        dist.barrier()
-        if rank == 0:
-            print(f"\n✓ {mode_name} - PASSED")
+    # Numerical assertions (should match llama3 test accuracy)
+    # llama3 test gets: dQ max ~0.000122, dK/dV max ~0.0156
+    # Allow small margin for zigzag pattern differences (increased for 8 GPUs)
+    assert max_dq_diff < 0.01, f"dQ max diff {max_dq_diff:.6f} exceeds tolerance 0.01"
+    assert max_dk_diff < 0.1, f"dK max diff {max_dk_diff:.6f} exceeds tolerance 0.1"
+    assert max_dv_diff < 0.1, f"dV max diff {max_dv_diff:.6f} exceeds tolerance 0.1"
+    assert mean_dq_diff < 1e-05, f"dQ mean diff {mean_dq_diff:.9f} exceeds tolerance 1e-05"
+    assert mean_dk_diff < 3e-04, f"dK mean diff {mean_dk_diff:.9f} exceeds tolerance 3e-04"
+    assert mean_dv_diff < 3e-04, f"dV mean diff {mean_dv_diff:.9f} exceeds tolerance 3e-04"
 
     dist.barrier()
     if rank == 0:
         print("\n" + "=" * 60)
-        print("# All tests PASSED!")
+        print("# Test PASSED!")
         print("=" * 60)
-        print("\n# NOTE: Two-kernels modes use optimized Triton kernel (no rearrangement)")
-        print("#       Fused modes use Python fallback (with rearrangement)")
-        print("#       Both should give identical results to reference Flash Attention")
+        print("\n# Zigzag Llama3 uses grouped attention calculation")
+        print("# (splits Q into groups, computes attention for each group)")
+        print("# Results match reference Flash Attention")
 
     dist.destroy_process_group()
 
